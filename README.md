@@ -93,7 +93,7 @@ ROTATE_CREDENTIALS=1 bash /root/onekey_reality_ipv4.sh
 >
 > `id` 是可选参数，省略后脚本会自动生成节点名称。手动填写时只支持英文字母、数字、点、下划线和连字符，不支持中文。下面示例均省略 `id`。
 
-命令开头的数字控制有效期，`IP_LIMIT` 是活跃来源 IP 数量，`PQ_GIB` 是双向总流量配额。
+命令开头的数字控制有效期，`IP_LIMIT` 是活跃来源 IP 数量，`PQ_GIB` 是双向总流量配额。如果要加id在时间后面加航id="xx"即可。
 
 ### 按分钟
 
