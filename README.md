@@ -9,6 +9,7 @@
 | `nat.sh` | NAT 出口机 | 配置并管理 NAT 出口 |
 | `natjichang.sh` | VLESS VPS | 安装 WG-NAT 临时节点工具 |
 | `traffic.py` | VLESS VPS | 可选：记录每日流量，保留最近 30 个自然日 |
+| `portbw-install.sh`、`portbw.py` | VLESS VPS | 可选：按端口独立设置 TCP+UDP 共用上传/下载限速 |
 
 > `natjichang.sh` 运行在 VLESS VPS，不是在 NAT 出口机。
 
@@ -328,26 +329,38 @@ vless_traffic 40002 --json
 
 从安装启用后开始记录，无法补回安装前的用量。统计按节点/端口归属，多人共用一个节点链接时会合并计算。流量包含 TCP 网络协议开销；每分钟采样的增量计入采样当天，因此跨午夜可能存在采样间隔内的日期归属误差。断电或外部清空统计计数器可能丢失尚未保存的增量。
 
-### 可选：TCP 端口独立限速
+### 可选：TCP+UDP 同端口共享限速（portbw）
 
-#### 安装
+此组件与 VLESS 节点管理、流量统计、WG-NAT 相互独立：**按本机监听端口限速，不绑定节点配置**。TCP 和 UDP 使用同一个端口时，二者在**上传方向合计使用一个额度**，在**下载方向合计使用另一个额度**；IPv4 和 IPv6 也共用各自方向的同一额度，不是每种协议分别限速。实际速度可能因协议开销、丢包和瞬时突发略有波动。
 
-在 VLESS VPS 以 root 执行（独立安装，不影响已有节点）：
+#### 一键安装 / 更新
+
+在 **VLESS VPS** 以 root 执行（不会修改 Xray、WireGuard、已有 nft 表及 root `fq` qdisc）：
 
 ```bash
 apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
 ```
 
-#### 使用方法
+安装器从**本正式仓库**下载 `portbw.py`、校验 SHA256 与 Python 语法，自动识别物理出口网卡，安装开机自动恢复服务和每 30 秒自检定时器。也可以将 `portbw-install.sh` 与 `portbw.py` 放在同一目录，通过 `bash portbw-install.sh` 本地安装。
+
+#### 设置、查询、取消
 
 ```bash
-portbw set 40001 10 20  # 40001：上传 10 Mbps，下载 20 Mbps
-portbw up 40001 15      # 修改上传限速
-portbw down 40001 30    # 修改下载限速
-portbw show 40001       # 查看端口状态
-portbw audit            # 检查所有限速规则
-portbw del 40001        # 仅取消该端口限速
+portbw set 40001 10 20  # 40001：TCP+UDP 合计上传 10 Mbps / 合计下载 20 Mbps
+portbw up 40001 15      # 上传上限改为 15 Mbps
+portbw down 40001 30    # 下载上限改为 30 Mbps
+portbw down 40001 0     # 仅关闭下载限速；上传额度不变
+portbw show 40001       # 查看端口配置及 nft/tc 状态
+portbw list             # 查看所有已保存的端口限速
+portbw audit            # 检查所有限速策略的生效状态
+portbw del 40001        # 仅取消端口限速，不删除 VLESS 节点
 ```
+
+`0` 表示对应方向**不限速**；两个方向都无需限速时用 `portbw del <端口>`。限速覆盖本机进入/离开的 TCP、UDP 流量，不覆盖任意 WireGuard/NAT `FORWARD` 转发流量；上传由 nftables + tc 执行限速，下载使用 tc egress 的单个共享 policer，nftables 负责计数（避免 OUTPUT 超限导致 UDP 程序 `Operation not permitted`）。`--nft-only` 不支持下载限速，请使用默认的 nft+tc 模式以获得完整双向限速。
+
+**旧版升级注意：** 本次升级改变了 tc flower 的协议槽位（从 TCP 专用改为 TCP+UDP 双协议）和保存的 `tc_prefs` 格式。**已使用旧版 `portbw` 创建策略的 VPS 不能保证直接无中断升级**。先执行 `portbw list` 并备份端口及速率；如需迁移，请在维护时段用**旧版** `portbw del <端口>` 逐个取消旧策略，确认旧 tc/nft 规则已清除后再运行上述新安装器，最后按记录重新执行 `portbw set`。取消到重建之间，该端口暂不受 portbw 限制。**不要手动 `nft flush ruleset` 或删除网卡 root qdisc**；发现旧规则残留应先检查，不要强制清理其他业务的规则。未安装过 portbw 的全新 VPS 可直接安装。
+
+**验收范围：** Debian 12 / `eth0` 上，IPv4 单协议、TCP+UDP 双向混合共享速率、反复修改/删除/重建、重启恢复，以及原始快照全新安装均已实测通过；该实测 VPS 未配置公网 IPv6，因此 IPv6 规则虽通过配置审计，但**没有 IPv6 实际测速结论**。不同发行版和网卡环境仍应进行自己的验收。
 
 ## 五、部署 WG-NAT
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone TCP port bandwidth policies. Owns only inet pbw_policy and tc filter slots.
+"""Standalone TCP+UDP shared port bandwidth policies. Owns only inet pbw_policy and tc filter slots.
 
 No dependency on VLESS, SOCKS5, WireGuard, or any external node lifecycle.
 Never changes a device root qdisc, BBR, iptables, or other nft tables.
@@ -29,6 +29,9 @@ PORT_RE=re.compile(r'^[0-9]{1,5}$')
 IF_RE=re.compile(r'^[a-zA-Z0-9_.-]{1,15}$')
 # High handle namespace; legacy handle=port must NEVER be auto-adopted/deleted.
 TC_HANDLE_PREFIX=0x0b700000
+TC_POLICE_PREFIX=0x6d000000
+FAMILIES=(4,6)
+TRANSPORTS=('tcp','udp')
 OWNED_RULE_RE=re.compile(r'^pbw-([1-9][0-9]{0,4})-(up|down)-(drop|count)$')
 
 class Error(Exception):pass
@@ -220,7 +223,8 @@ def owned(items,port):
 
 def expected_comments(port,rec):
     return {comment(direction,port,suffix)
-            for direction in CHAIN if rec[direction]>0 for suffix in ('drop','count')}
+            for direction in CHAIN if rec[direction]>0
+            for suffix in (('drop','count') if direction=='up' else ('count',))}
 
 def _named_ref(expr,kind):
     val=expr.get(kind,'__missing__') if isinstance(expr,dict) else '__missing__'
@@ -261,13 +265,21 @@ def _rule_exact(rule,port,d,kind):
     if rule.get('chain')!=CHAIN[d] or rule.get('family','inet')!='inet' \
        or rule.get('table',TABLE)!=TABLE:return False
     field='dport' if d=='up' else 'sport'
-    exp=[{'match':{'op':'==','left':{'payload':{'protocol':'tcp','field':field}},'right':port}}]
+    # One rule and one named limiter for both TCP/UDP and IPv4/IPv6.
+    # nftables JSON represents set membership as == or in, depending on version.
     expr=rule.get('expr')
-    if not isinstance(expr,list) or len(expr)!=(3 if kind=='drop' else 2):return False
-    if expr[0]!=exp[0]:return False
+    if not isinstance(expr,list) or len(expr)!=(4 if kind=='drop' else 3):return False
+    proto=expr[0].get('match') if isinstance(expr[0],dict) else None
+    if not isinstance(proto,dict) or proto.get('op') not in ('==','in') \
+       or proto.get('left')!={'meta':{'key':'l4proto'}}:return False
+    values=proto.get('right',{}).get('set') if isinstance(proto.get('right'),dict) else None
+    if not isinstance(values,list) or len(values)!=2 \
+       or {str(x).lower() for x in values} not in ({'tcp','udp'},{'6','17'}):return False
+    if expr[1]!={'match':{'op':'==','left':{'payload':{'protocol':'th','field':field}},'right':port}}:
+        return False
     if kind=='drop':
-        return _named_ref(expr[1],'limit')==limitname(d,port) and expr[2]=={'drop':None}
-    return _named_ref(expr[1],'counter')==countname(d,port)
+        return d=='up' and _named_ref(expr[2],'limit')==limitname(d,port) and expr[3]=={'drop':None}
+    return _named_ref(expr[2],'counter')==countname(d,port)
 
 def nft_ok(port,rec,items=None):
     try:
@@ -277,23 +289,28 @@ def nft_ok(port,rec,items=None):
         desired=expected_comments(port,rec)
         rows=[x['rule'] for x in items if 'rule' in x and str(x['rule'].get('comment','')).startswith(f'pbw-{port}-')]
         if {x['comment'] for x in rows}!=desired or len(rows)!=len(desired):return False
+        # Inbound: nft and tc can both police. Outbound: nft OUTPUT drops
+        # return EPERM to local UDP sendmsg(), aborting apps such as iperf3.
+        # Only shared tc egress enforces outbound; nft keeps an exact counter.
         expected_obj={(kind,fun(d,port)) for d in CHAIN if rec[d]>0
-                      for kind,fun in (('limit',limitname),('counter',countname))}
+                      for kind,fun in ((('limit',limitname),('counter',countname)) if d=='up'
+                                       else (('counter',countname),))}
         if set(objects)!=expected_obj or len(objects)!=len(expected_obj):return False
         for d in CHAIN:
             if not rec[d]:continue
-            lims=[x['limit'] for x in items if 'limit' in x and x['limit'].get('name')==limitname(d,port)]
-            if len(lims)!=1:return False
-            lim=lims[0]
-            if _limit_rate(lim)!=rec[d] or lim.get('per','second')!='second' \
-                or lim.get('inv') is not True \
-                or _limit_burst(lim)!=burst_bytes(rec[d]):return False
-            for kind in ('drop','count'):
+            if d=='up':
+                lims=[x['limit'] for x in items if 'limit' in x and x['limit'].get('name')==limitname(d,port)]
+                if len(lims)!=1:return False
+                lim=lims[0]
+                if _limit_rate(lim)!=rec[d] or lim.get('per','second')!='second' \
+                    or lim.get('inv') is not True \
+                    or _limit_burst(lim)!=burst_bytes(rec[d]):return False
+            for kind in (('drop','count') if d=='up' else ('count',)):
                 selected=[r for r in rows if r['comment']==comment(d,port,kind)]
                 if len(selected)!=1 or not _rule_exact(selected[0],port,d,kind):return False
             # DROP must precede named counter, and no earlier accept/bypass exists.
             order={r['comment']:i for i,x in enumerate(items) if (r:=x.get('rule'))}
-            if order[comment(d,port,'drop')]>=order[comment(d,port,'count')]:return False
+            if d=='up' and order[comment(d,port,'drop')]>=order[comment(d,port,'count')]:return False
         return True
     except (Error,ValueError,TypeError,KeyError,StopIteration):return False
 
@@ -306,11 +323,18 @@ def apply_nft(port,rec):
         b=rec[d]
         if not b:continue
         l=limitname(d,port);c=countname(d,port);f='dport' if d=='up' else 'sport'
-        script.extend([
-            f'add limit inet {TABLE} {l} {{ rate over {b} bytes/second burst {burst_bytes(b)} bytes; }}',
-            f'add counter inet {TABLE} {c}',
-            f'add rule inet {TABLE} {CHAIN[d]} tcp {f} {port} limit name "{l}" drop comment "{comment(d,port,"drop")}"',
-            f'add rule inet {TABLE} {CHAIN[d]} tcp {f} {port} counter name "{c}" comment "{comment(d,port,"count")}"'])
+        if d=='up':
+            script.extend([
+                f'add limit inet {TABLE} {l} {{ rate over {b} bytes/second burst {burst_bytes(b)} bytes; }}',
+                f'add counter inet {TABLE} {c}',
+                f'add rule inet {TABLE} {CHAIN[d]} meta l4proto {{ tcp, udp }} th {f} {port} limit name "{l}" drop comment "{comment(d,port,"drop")}"',
+                f'add rule inet {TABLE} {CHAIN[d]} meta l4proto {{ tcp, udp }} th {f} {port} counter name "{c}" comment "{comment(d,port,"count")}"'])
+        else:
+            # No OUTPUT nft DROP: exceedance would raise EPERM to UDP apps.
+            # The single tc egress policer is the enforceable aggregate cap.
+            script.extend([
+                f'add counter inet {TABLE} {c}',
+                f'add rule inet {TABLE} {CHAIN[d]} meta l4proto {{ tcp, udp }} th {f} {port} counter name "{c}" comment "{comment(d,port,"count")}"'])
     if script:run(['nft','-f','-'],input='\n'.join(script)+'\n')
     if not nft_ok(port,rec):raise Error(f'端口 {port}: nft 限速未能通过生效校验')
 
@@ -339,15 +363,22 @@ def tc_protocol(family):return 'ip' if family==4 else 'ipv6'
 def tc_handle(port):
     return TC_HANDLE_PREFIX | port_num(port)
 
-def tc_pref(port,family,rec=None):
-    """Persistent per-family preference; never assume two protocols can share one."""
-    value=(rec or {}).get('tc_prefs',{}).get(str(family),port)
+def tc_slot_key(family,transport):
+    return f'{family}_{transport}'
+
+def tc_pref(port,family,transport,rec=None):
+    key=tc_slot_key(family,transport)
+    value=(rec or {}).get('tc_prefs',{}).get(key)
     if type(value) is not int or not 1<=value<=65535:
-        raise Error(f'{port}: IPv{family} tc pref 无效')
+        raise Error(f'{port}: IPv{family} {transport} tc pref 无效')
     return value
 
-def _tc_slot_owned(row,port,dir,family):
-    """Recognize only our exact flower identity, never a third-party filter."""
+def tc_police_index(port,direction):
+    # Deterministic, per-port, per-direction shared policer index, all L3/L4
+    # filters point to this SINGLE tc action. No mixing between up and down.
+    return TC_POLICE_PREFIX + port_num(port)*2 + (1 if direction=='down' else 0)
+
+def _tc_slot_owned(row,port,direction,family,transport):
     opts=row.get('options')
     if row.get('protocol')!=tc_protocol(family) or row.get('kind')!='flower' or not isinstance(opts,dict):
         return False
@@ -355,11 +386,11 @@ def _tc_slot_owned(row,port,dir,family):
     try:handle=handle if isinstance(handle,int) else int(str(handle),16)
     except (ValueError,TypeError):return False
     keys=opts.get('keys')
-    field='dst_port' if dir=='up' else 'src_port'
+    field='dst_port' if direction=='up' else 'src_port'
     return (handle==tc_handle(port) and row.get('chain',0) in (0,'0')
             and isinstance(keys,dict)
             and set(keys) in ({'ip_proto',field},{'ip_proto',field,'eth_type'})
-            and str(keys['ip_proto']).lower() in ('tcp','6')
+            and str(keys['ip_proto']).lower() in (transport, '6' if transport=='tcp' else '17')
             and str(keys[field])==str(port)
             and ('eth_type' not in keys or keys['eth_type']==('ipv4' if family==4 else 'ipv6')))
 
@@ -379,12 +410,8 @@ def _legacy_slot_owned(row,port,direction):
             and str(keys['ip_proto']).lower() in ('tcp','6') and str(keys[field])==str(port)
             and ('eth_type' not in keys or keys['eth_type']==('ipv4' if family==4 else 'ipv6')))
 
-def _used_tc_prefs(all_rows,port,direction,family,allow_legacy=False):
-    """Return preferences used by any filter other than this owned slot.
-
-    A tc JSON header has no options: permit it only when all real filters
-    at that preference are exact owned rules, never a third-party filter.
-    """
+def _used_tc_prefs(all_rows,port,direction,family,transport):
+    """Return preferences used by any rule other than the exact owned slot."""
     groups={}
     for row in all_rows:
         try:pref=int(row['pref'])
@@ -393,98 +420,75 @@ def _used_tc_prefs(all_rows,port,direction,family,allow_legacy=False):
     busy=set()
     for pref,rows in groups.items():
         details=[r for r in rows if isinstance(r.get('options'),dict)]
-        if not details:
-            busy.add(pref)  # Unknown summary-only preference is not safe to adopt.
-            continue
-        if all(_tc_slot_owned(r,port,direction,family) or
-               (allow_legacy and _legacy_slot_owned(r,port,direction)) for r in details):
-            continue
-        busy.add(pref)
+        if not details or not all(_tc_slot_owned(r,port,direction,family,transport) for r in details):
+            busy.add(pref)
     return busy
 
-def ensure_tc_prefs(port,rec,iface,allow_legacy=False):
-    """Assign two distinct globally unshared preferences before modifying tc.
-
-    Read-only inspection comes first. State is persisted with pending=True, so
-    a crash cannot lose the chosen priority while filters remain installed.
-    Existing IPv4 filter at pref=port remains untouched on Debian 12.
-    """
+def ensure_tc_prefs(port,rec,iface):
+    """Allocate FOUR globally distinct flower priorities; persist before installing."""
     rows={d:tc_filters(iface,d) for d in ('ingress','egress')}
-    saved=records()
     used=set()
-    for other,r in saved.items():
+    for other,r in records().items():
         if other==port:continue
         prefs=r.get('tc_prefs')
-        if prefs:
-            for value in prefs.values():
-                if type(value) is not int or not 1<=value<=65535:raise Error(f'{other}: tc pref 记录损坏')
-                if value in used:raise Error('端口间 tc pref 重复，拒绝继续')
-                used.add(value)
-        else:
-            # Old/pre-upgrade records may have a real IPv4 filter at pref=port.
-            used.add(other)
+        if not isinstance(prefs,dict) or set(prefs)!={tc_slot_key(f,t) for f in FAMILIES for t in TRANSPORTS}:
+            raise Error(f'{other}: 检测到旧版/损坏的 tc pref，测试版要求恢复未安装 portbw 的快照')
+        for value in prefs.values():
+            if type(value) is not int or not 1<=value<=65535 or value in used:
+                raise Error(f'{other}: tc pref 重复/损坏')
+            used.add(value)
+    slots=[(f,t) for f in FAMILIES for t in TRANSPORTS]
     existing=rec.get('tc_prefs')
     if existing is not None:
-        if not isinstance(existing,dict) or set(existing)!={'4','6'}:
-            raise Error(f'{port}: tc pref 记录损坏')
-        p4,p6=tc_pref(port,4,rec),tc_pref(port,6,rec)
-        if p4==p6 or p4 in used or p6 in used:
-            raise Error(f'{port}: tc pref 冲突，拒绝覆盖其他端口')
-        selected={'4':p4,'6':p6}
+        if not isinstance(existing,dict) or set(existing)!={tc_slot_key(f,t) for f,t in slots}:
+            raise Error(f'{port}: 检测到旧版 tc 状态，请恢复干净快照后再测试')
+        selected={key:tc_pref(port,int(key[0]),key[2:],rec) for key in existing}
+        if len(set(selected.values()))!=len(slots) or any(v in used for v in selected.values()):
+            raise Error('tc pref 与其他端口冲突')
     else:
-        # Reserve current port priority for its IPv4 rule when possible.
-        def occupied(pref,family):
+        selected={}
+        def occupied(pref,family,transport):
             if pref in used:return True
             for direction,tcdir in (('up','ingress'),('down','egress')):
-                if pref in _used_tc_prefs(rows[tcdir],port,direction,family,allow_legacy):return True
+                if pref in _used_tc_prefs(rows[tcdir],port,direction,family,transport):return True
             return False
-        owns_v4=any(_tc_slot_owned(row,port,direction,4)
-                    for direction,tcdir in (('up','ingress'),('down','egress'))
-                    for row in rows[tcdir] if str(row.get('pref'))==str(port))
-        if owns_v4 and occupied(port,4):
-            raise Error(f'{port}: 原 IPv4 tc 规则占用的 pref={port} 出现外部冲突，拒绝遗留孤儿规则')
-        p4=port if not occupied(port,4) else None
-        if p4 is None:
-            for candidate in range(65535,0,-1):
-                if not occupied(candidate,4):p4=candidate;break
-        if p4 is None:raise Error('tc 优先级已用完，无法分配 IPv4')
-        used.add(p4)
-        p6=None
-        for candidate in range(65535,0,-1):
-            if not occupied(candidate,6):p6=candidate;break
-        if p6 is None:raise Error('tc 优先级已用完，无法分配 IPv6')
-        selected={'4':p4,'6':p6}
-    # Explicitly check both family slots on BOTH directions for any foreign
-    # occupant, including another protocol on the selected preference.
+        for family,transport in slots:
+            # Reserve port priority for v4 TCP, otherwise search downwards.
+            pref=port if (family,transport)==(4,'tcp') and not occupied(port,family,transport) else None
+            if pref is None:
+                for candidate in range(65535,0,-1):
+                    if not occupied(candidate,family,transport):pref=candidate;break
+            if pref is None:raise Error('tc 优先级不足，无法为 TCP/UDP 双栈分配四个槽位')
+            selected[tc_slot_key(family,transport)]=pref
+            used.add(pref)
     for direction,tcdir in (('up','ingress'),('down','egress')):
-        for family in (4,6):
-            pref=selected[str(family)]
-            if pref in _used_tc_prefs(rows[tcdir],port,direction,family,allow_legacy):
-                raise Error(f'{port}: {tcdir} pref={pref} 已有非本模块规则，拒绝覆盖')
+        for family,transport in slots:
+            pref=selected[tc_slot_key(family,transport)]
+            if pref in _used_tc_prefs(rows[tcdir],port,direction,family,transport):
+                raise Error(f'{port} {tcdir}: pref={pref} 存在非本模块 tc 规则')
     if existing is None:
         rec['tc_prefs']=selected
         rec['pending']=True
         write_json(port_file(port),rec)
     return selected
 
-def tc_target(port,dir,family,rec=None):
-    return {'pref':tc_pref(port,family,rec),'protocol':tc_protocol(family),
+def tc_target(port,direction,family,transport,rec):
+    return {'pref':tc_pref(port,family,transport,rec),'protocol':tc_protocol(family),
             'handle':f'0x{tc_handle(port):x}',
-            'field':'dst_port' if dir=='up' else 'src_port'}
+            'field':'dst_port' if direction=='up' else 'src_port'}
 
-def tc_find(iface,port,dir,family,rows=None,strict=True,pref=None):
-    expected=tc_target(port,dir,family)
-    if pref is not None:expected['pref']=pref
-    if rows is None:rows=tc_filters(iface,'ingress' if dir=='up' else 'egress')
+def tc_find(iface,port,direction,family,transport,rec,rows=None,strict=True):
+    expected=tc_target(port,direction,family,transport,rec)
+    if rows is None:rows=tc_filters(iface,'ingress' if direction=='up' else 'egress')
     candidates=[]
     for entry in rows:
         try:epref=int(entry.get('pref',-1))
         except (TypeError,ValueError):continue
         if epref!=expected['pref']:continue
         opts=entry.get('options')
-        if not isinstance(opts,dict):continue  # tc summary/header row
-        if not _tc_slot_owned(entry,port,dir,family):
-            if strict:raise Error(f'{iface} {dir} IPv{family}: pref={expected["pref"]} 已被其他 tc 过滤器占用，拒绝覆盖')
+        if not isinstance(opts,dict):continue
+        if not _tc_slot_owned(entry,port,direction,family,transport):
+            if strict:raise Error(f'{iface} {direction} IPv{family}/{transport}: pref={expected["pref"]} 被外部过滤器占用')
             continue
         candidates.append(entry)
     if len(candidates)>1:raise Error('tc 检测到重复过滤器')
@@ -498,38 +502,36 @@ def _quantity_bytes(number,unit):
 def tc_burst_kb(rate):
     return max(64,min(1024,(rate//10+1023)//1024))
 
-def _tc_filter_body(text,port,dir,family,handle=None,pref=None):
-    # Scope to exactly our own handle, never a neighboring pref summary/action.
-    if handle is None:handle=tc_handle(port)
+def _tc_filter_body(text,port,direction,family,transport,pref):
     protocol=tc_protocol(family)
-    if pref is None:pref=port
     head=re.compile(r'^filter protocol '+re.escape(protocol)+r' pref '+str(pref)+
-                    r' flower chain 0 handle (?:0x)?'+format(handle,'x')+r'\b',re.M)
+                    r' flower chain 0 handle (?:0x)?'+format(tc_handle(port),'x')+r'\b',re.M)
     m=head.search(text)
     if not m:return None
     next_filter=re.search(r'^filter protocol ',text[m.end():],re.M)
     return text[m.end():m.end()+next_filter.start() if next_filter else len(text)]
 
-def tc_rate_is_ok(entry,b,iface=None,dir=None,port=None,family=None,text=None,handle=None,pref=None):
-    if not entry or not all(x is not None for x in (iface,dir,port,family)):return False
+def tc_rate_is_ok(entry,b,iface,direction,port,family,transport,rec,text=None):
+    if not entry:return False
     try:
-        if text is None:text=run(['tc','-s','filter','show','dev',iface,'ingress' if dir=='up' else 'egress'])
-        fragment=_tc_filter_body(text,port,dir,family,handle,pref)
+        if text is None:text=run(['tc','-s','filter','show','dev',iface,'ingress' if direction=='up' else 'egress'])
+        pref=tc_pref(port,family,transport,rec)
+        fragment=_tc_filter_body(text,port,direction,family,transport,pref)
         if not fragment:return False
-        field='dst_port' if dir=='up' else 'src_port'
+        field='dst_port' if direction=='up' else 'src_port'
         expected_type='ipv4' if family==4 else 'ipv6'
         lines=[l.strip() for l in fragment.splitlines() if l.strip()]
-        # Require the full *unrestricted* L3/L4 match and software enforcement.
-        # Everything before the police action must be precisely our intended
-        # flower match (plus the harmless "not_in_hw" kernel status marker).
         index=next((i for i,l in enumerate(lines) if l.startswith('action order ')),None)
         if index is None:return False
         before=lines[:index]
-        expected=[f'eth_type {expected_type}','ip_proto tcp',f'{field} {port}','skip_hw']
+        expected=[f'eth_type {expected_type}',f'ip_proto {transport}',f'{field} {port}','skip_hw']
         if before not in (expected,expected+['not_in_hw']):return False
         actions=[l for l in lines if l.startswith('action order ')]
-        if len(actions)!=1 or not re.search(r'^action order 1:\s+police\s+',actions[0]):return False
+        if len(actions)!=1:return False
         line=actions[0]
+        # Crucial: all FOUR flowers per direction must reference the exact SAME action index.
+        police=re.search(r'^action order 1:\s+police\s+0x([0-9a-fA-F]+)\s+',line)
+        if not police or int(police.group(1),16)!=tc_police_index(port,direction):return False
         rm=re.search(r'\brate\s+([0-9]+(?:\.[0-9]+)?)\s*([kKmMgGtT]?)bit\b',line)
         if not rm:return False
         mult={'':1,'k':1000,'m':1000000,'g':1000000000,'t':1000000000000}[rm.group(2).lower()]
@@ -539,42 +541,120 @@ def tc_rate_is_ok(entry,b,iface=None,dir=None,port=None,family=None,text=None,ha
         bm=re.search(r'\bburst\s+([0-9]+(?:\.[0-9]+)?)([kKmMgG]?)b\b',line)
         if not bm:return False
         actual_burst=_quantity_bytes(bm.group(1),bm.group(2))
-        # Kernel rounds token bucket to a cell; tolerate only a small rounding error.
         desired_burst=Decimal(tc_burst_kb(b)*1024)
         if abs(actual_burst-desired_burst)>max(Decimal(256),desired_burst*Decimal('0.05')):return False
         if not re.search(r'\baction drop(?:/ok)?(?:\s|$)',line):return False
         return True
     except (Error,ValueError,InvalidOperation,TypeError):return False
 
+def tc_index_attached(text,port,direction,family,transport,pref):
+    fragment=_tc_filter_body(text,port,direction,family,transport,pref)
+    if not fragment:return False
+    m=re.search(r'^\s*action order 1:\s+police\s+0x([0-9a-fA-F]+)\b',fragment,re.M)
+    return bool(m and int(m.group(1),16)==tc_police_index(port,direction))
+
+
 def apply_tc(port,rec,iface):
     tc_prepare(iface)
-    # Preflight ALL slots before touching any old rule. No deletion of a
-    # foreign filter is ever allowed, even if only the protocol differs.
-    plan=[]
     rows={d:tc_filters(iface,d) for d in ('ingress','egress')}
+    plan=[]
     for direction in CHAIN:
         tcdir='ingress' if direction=='up' else 'egress'
-        for family in (4,6):
-            pref=tc_pref(port,family,rec)
-            if pref in _used_tc_prefs(rows[tcdir],port,direction,family):
-                raise Error(f'{port}: {tcdir} pref={pref} 存在非本模块规则，拒绝修改')
-            old=tc_find(iface,port,direction,family,rows[tcdir],strict=True,pref=pref)
-            plan.append((direction,tcdir,family,pref,old))
-    for direction,tcdir,family,pref,old in plan:
-        proto=tc_protocol(family)
-        if rec[direction]==0:
-            if old:
-                run(['tc','filter','del','dev',iface,tcdir,'protocol',proto,
-                     'pref',str(pref),'handle',f'0x{tc_handle(port):x}','flower'])
-            continue
-        if old and tc_rate_is_ok(old,rec[direction],iface,direction,port,family,pref=pref):continue
-        field='dst_port' if direction=='up' else 'src_port'
+        for family in FAMILIES:
+            for transport in TRANSPORTS:
+                pref=tc_pref(port,family,transport,rec)
+                if pref in _used_tc_prefs(rows[tcdir],port,direction,family,transport):
+                    raise Error(f'{port}: {tcdir} pref={pref} 包含外部规则，拒绝修改')
+                old=tc_find(iface,port,direction,family,transport,rec,rows[tcdir])
+                plan.append((direction,tcdir,family,transport,pref,old))
+    # Create the shared policer on the first flower; the other three share it.
+    # On Debian 12, its last reference can survive all flower deletions as
+    # ref=1 bind=0. Only GC this exact previously verified index once unbound.
+    for direction in CHAIN:
+        tcdir='ingress' if direction=='up' else 'egress'
+        theirs=[p for p in plan if p[0]==direction]
+        existing=[p for p in theirs if p[5] is not None]
+        text=run(['tc','-s','filter','show','dev',iface,tcdir]) if existing else ''
+        if rec[direction]>0 and len(existing)==len(theirs):
+            if all(tc_rate_is_ok(old,rec[direction],iface,direction,port,f,t,rec,text)
+                   for _,_,f,t,_,old in theirs):continue
+        index=tc_police_index(port,direction)
+        # Check every old slot before deletion; never adopt foreign bindings.
+        for _,_,family,transport,pref,old in existing:
+            if not tc_index_attached(text,port,direction,family,transport,pref):
+                raise Error(f'{port}: {tcdir} {transport}/IPv{family} police index 不属于本模块，拒绝删除')
+        if not existing and tc_action_exists(index):
+            raise Error(f'{port}: tc police index {index} 已被占用，拒绝覆盖')
+        for _,_,family,transport,pref,old in existing:
+            run(['tc','filter','del','dev',iface,tcdir,'protocol',tc_protocol(family),
+                 'pref',str(pref),'handle',f'0x{tc_handle(port):x}','flower'])
+        # The policer can legitimately outlive all four flower filters.
+        # Never delete an index belonging to somebody else: all former slots
+        # were verified as ours, and only ref=1/bind=0 may be collected.
+        if existing:
+            tc_gc_unbound_police(port,index)
+        if rec[direction]==0:continue
         kb=tc_burst_kb(rec[direction])
-        run(['tc','filter','replace' if old else 'add','dev',iface,tcdir,
-             'protocol',proto,'pref',str(pref),'handle',f'0x{tc_handle(port):x}',
-             'flower','skip_hw','ip_proto','tcp',field,str(port),
-             'action','police','rate',f'{rec[direction]*8}bit','burst',f'{kb}k',
-             'conform-exceed','drop/ok'])
+        for n,(_,_,family,transport,pref,_) in enumerate(theirs):
+            field='dst_port' if direction=='up' else 'src_port'
+            cmd=['tc','filter','add','dev',iface,tcdir,'protocol',tc_protocol(family),
+                 'pref',str(pref),'handle',f'0x{tc_handle(port):x}',
+                 'flower','skip_hw','ip_proto',transport,field,str(port),
+                 'action','police']
+            if n==0:
+                # Kernel atomically creates the policer and attaches filter 1.
+                # skip_hw applies to both flower and action to avoid mismatch.
+                cmd.extend(['rate',f'{rec[direction]*8}bit','burst',f'{kb}k',
+                            'conform-exceed','drop/ok','index',str(index),'skip_hw'])
+            else:cmd.extend(['index',str(index)])
+            run(cmd)
+
+
+def tc_action_block(index):
+    """Return the exact global tc police entry for an action index, if any."""
+    output=run(['tc','-s','actions','ls','action','police'])
+    heads=list(re.finditer(r'^\s*action order [0-9]+:\s+police\s+0x([0-9a-f]+)\b',
+                           output,re.I|re.M))
+    matches=[i for i,m in enumerate(heads) if int(m.group(1),16)==index]
+    if len(matches)>1:raise Error(f'tc police index {index} 存在重复输出，拒绝修改')
+    if not matches:return None
+    m=heads[matches[0]]
+    following=heads[matches[0]+1].start() if matches[0]+1<len(heads) else len(output)
+    return output[m.start():following]
+
+
+def tc_action_exists(index):
+    return tc_action_block(index) is not None
+
+
+def tc_gc_unbound_police(port,index):
+    """Wait for tc's deferred flower-action releases; GC only a truly unbound owned index.
+
+    Linux may briefly report ref=1/bind=1 after the fourth flower is deleted.
+    Do not mistake that transient state for a permanent foreign binding.  A
+    STILL-bound action is never force-deleted, even if the timeout expires.
+    """
+    deadline=time.monotonic()+12
+    removed=False
+    while True:
+        block=tc_action_block(index)
+        if block is None:return
+        counts=re.search(r'\bref\s+([0-9]+)\s+bind\s+([0-9]+)\b',block)
+        if not counts:raise Error(f'{port}: police index {index} 缺少 ref/bind，拒绝删除')
+        refs,binds=map(int,counts.groups())
+        if (not re.search(r'\baction\s+drop\b',block) or
+                not re.search(r'^\s*skip_hw\s*$',block,re.M)):
+            raise Error(f'{port}: police index {index} 属性异常，拒绝删除')
+        if not removed and refs==1 and binds==0:
+            # Only this verified, now-unbound index may be deleted; no global flush.
+            run(['tc','actions','delete','action','police','index',str(index)])
+            removed=True
+            continue
+        if time.monotonic()>=deadline:
+            raise Error(f'{port}: police index {index} 等待解绑/回收超时(ref={refs},bind={binds})；'
+                        '未强制删除，请检查 tc 引用')
+        time.sleep(0.25)
+
 
 def tc_snapshot(iface):
     # One coherent read pass per audit/watch invocation, not per customer port.
@@ -587,27 +667,30 @@ def tc_snapshot(iface):
 def tc_ok(port,rec,iface,snap=None):
     try:
         if 'clsact' not in {e.get('kind') for e in (snap['qdiscs'] if snap else tc_qdiscs(iface))}:return False
-        for d in CHAIN:
-            tcdir='ingress' if d=='up' else 'egress'
+        for direction in CHAIN:
+            tcdir='ingress' if direction=='up' else 'egress'
             rows=snap['rows'][tcdir] if snap else tc_filters(iface,tcdir)
-            # Never treat a filter at the desired pref under a different
-            # protocol as absent: the kernel can reject that combination.
-            for f in (4,6):
-                pref=tc_pref(port,f,rec)
-                if pref in _used_tc_prefs(rows,port,d,f):return False
-            entries=[tc_find(iface,port,d,f,rows,strict=rec[d]>0,
-                             pref=tc_pref(port,f,rec)) for f in (4,6)]
-            if rec[d]==0:
-                if any(entries):return False
+            targets=[]
+            for family in FAMILIES:
+                for transport in TRANSPORTS:
+                    pref=tc_pref(port,family,transport,rec)
+                    if pref in _used_tc_prefs(rows,port,direction,family,transport):return False
+                    entry=tc_find(iface,port,direction,family,transport,rec,rows,strict=rec[direction]>0)
+                    targets.append((family,transport,entry))
+            if rec[direction]==0:
+                if any(entry for _,_,entry in targets) or tc_action_exists(tc_police_index(port,direction)):
+                    return False
                 continue
-            if not all(entries):return False
+            if not all(entry for _,_,entry in targets):return False
             text=snap['text'][tcdir] if snap else run(['tc','-s','filter','show','dev',iface,tcdir])
-            if not all(tc_rate_is_ok(e,rec[d],iface,d,port,f,text,pref=tc_pref(port,f,rec))
-                       for e,f in zip(entries,(4,6))):return False
+            if not all(tc_rate_is_ok(entry,rec[direction],iface,direction,port,family,transport,rec,text)
+                       for family,transport,entry in targets):return False
         return True
     except Error:return False
 
 def apply(port,rec,config):
+    if rec['down']>0 and not config.get('tc_enabled'):
+        raise Error('UDP/TCP 下载限速必须使用 tc egress；不可采用 nft-only，以免本地发送程序收到 EPERM')
     if not nft_ok(port,rec):apply_nft(port,rec)
     if config.get('tc_enabled'):
         ensure_tc_prefs(port,rec,config['iface'])
@@ -616,60 +699,6 @@ def apply(port,rec,config):
             if not tc_ok(port,rec,config['iface']):
                 raise Error(f'{port} 双层限速尚未通过完整审计，保留 pending 状态供修复')
 
-def migrate_legacy(port,config):
-    """Explicit operator-approved migration; never auto-adopts handle=port."""
-    if not config.get('tc_enabled'):
-        raise Error('nft-only 模式无需迁移 tc')
-    rec=read_json(port_file(port))
-    if rec.get('pending') or rec.get('deleting'):
-        raise Error('端口正在变更/删除中，请先解决 pending')
-    if not nft_ok(port,rec):
-        raise Error('nft 主限速层未通过检查，拒绝迁移旧 tc')
-    iface=config['iface']
-    if 'clsact' not in {x.get('kind') for x in tc_qdiscs(iface)}:
-        raise Error('clsact 不存在，无法安全验证旧规则')
-    targets=[]
-    # Preflight ALL four slots before deleting even one legacy rule.
-    for direction in CHAIN:
-        tcdir='ingress' if direction=='up' else 'egress'
-        rows=tc_filters(iface,tcdir)
-        text=run(['tc','-s','filter','show','dev',iface,tcdir])
-        for family in (4,6):
-            matches=[]
-            for row in rows:
-                if str(row.get('pref'))!=str(port) or row.get('protocol')!=tc_protocol(family):continue
-                opts=row.get('options')
-                if not isinstance(opts,dict):continue
-                h=opts.get('handle',row.get('handle',''))
-                try:handle=h if isinstance(h,int) else int(str(h),16)
-                except (ValueError,TypeError):handle=-1
-                fld='dst_port' if direction=='up' else 'src_port'
-                keys=opts.get('keys',{})
-                exact=(row.get('kind')=='flower' and handle==port and isinstance(keys,dict)
-                       and set(keys) in ({'ip_proto',fld},{'eth_type','ip_proto',fld})
-                       and ('eth_type' not in keys or keys['eth_type']==('ipv4' if family==4 else 'ipv6'))
-                       and str(keys['ip_proto']).lower() in ('tcp','6')
-                       and str(keys[fld])==str(port) and row.get('chain',0) in (0,'0'))
-                if not exact:raise Error(f'IPv{family} {tcdir} 存在未知过滤器，停止迁移')
-                matches.append(row)
-            if not rec[direction]:
-                if matches:raise Error('无限速方向存在旧 tc 规则，拒绝迁移')
-                continue
-            if len(matches)!=1 or not tc_rate_is_ok(matches[0],rec[direction],iface,
-                                                    direction,port,family,text,handle=port):
-                raise Error(f'IPv{family} {tcdir} 旧 tc 规则校验失败，未做任何改动')
-            targets.append((tcdir,tc_protocol(family)))
-    # Persist the future mapping and pending marker BEFORE removing legacy filters.
-    # Ignore only legacy filters positively checked above; never unknown tc rules.
-    ensure_tc_prefs(port,rec,iface,allow_legacy=True)
-    for tcdir,proto in targets:
-        run(['tc','filter','del','dev',iface,tcdir,'protocol',proto,
-             'pref',str(port),'handle',f'0x{port:x}','flower'])
-    # In the small transition interval, nft still enforces the hard ceiling.
-    apply_tc(port,rec,iface)
-    if not tc_ok(port,rec,iface):raise Error('迁移后双层校验失败；nft 主限速仍应存在，请检查')
-    rec['pending']=False;write_json(port_file(port),rec)
-    print(f'{port}: 旧版 tc 已迁入独立保留 handle 命名空间')
 
 def commit(port,up,down,config,deleting=False):
     old=read_json(port_file(port),default={})
@@ -683,7 +712,7 @@ def commit(port,up,down,config,deleting=False):
         rec['pending']=False;write_json(port_file(port),rec)
 
 def listen_ports():
-    out=run(['ss','-H','-ltn'],check=False) or ''
+    out=run(['ss','-H','-ltnu'],check=False) or ''
     found=set()
     for row in out.splitlines():
         m=re.search(r':(\d+)\s',row+' ')
@@ -693,7 +722,8 @@ def listen_ports():
 def audit_one(port,rec,config,nft_items=None,tc_items=None):
     nft=nft_ok(port,rec,nft_items)
     tc=tc_ok(port,rec,config['iface'],tc_items) if config.get('tc_enabled') else None
-    return ('OK' if nft and (tc is None or tc) and not rec.get('pending') else 'STALE',nft,tc)
+    return ('OK' if nft and (tc is None or tc) and not (rec['down']>0 and tc is None)
+            and not rec.get('pending') else 'STALE',nft,tc)
 
 def units():
     exe='/usr/local/sbin/portbw'
@@ -763,7 +793,8 @@ def install(args):
         run(['nft','-c','-f','-'],input=(
             'add table inet pbw_capability_probe\n'
             'add chain inet pbw_capability_probe test { type filter hook input priority -5; policy accept; }\n'
-            'add limit inet pbw_capability_probe lim { rate over 125000 bytes/second burst 16384 bytes; }\n'))
+            'add limit inet pbw_capability_probe lim { rate over 125000 bytes/second burst 16384 bytes; }\n'
+            'add rule inet pbw_capability_probe test meta l4proto { tcp, udp } th dport 54321 limit name "lim" drop\n'))
         # Never replace settings while active policies would silently migrate to a different iface.
         if before and before.get('iface')!=iface and records():
             raise Error('已有端口规则，禁止静默修改绑定网卡；先在原网卡解除 tc 后迁移')
@@ -815,9 +846,6 @@ def operate(args):
     with lock(try_only=action=='watch') as got:
         if not got:return
         config=cfg()
-        if action=='migrate-legacy':
-            if not args.confirm:raise Error('必须显式指定 --confirm；请先停止旧 portbw-watch.timer 并备份规则')
-            return migrate_legacy(port_num(args.port),config)
         if action in ('set','up','down','del'):
             port=port_num(args.port)
             current=read_json(port_file(port),default={'port':port,'up':0,'down':0})
@@ -876,7 +904,6 @@ def main():
     x=subs.add_parser('down');x.add_argument('port');x.add_argument('down_mbit')
     x=subs.add_parser('del');x.add_argument('port')
     x=subs.add_parser('show');x.add_argument('port')
-    x=subs.add_parser('migrate-legacy');x.add_argument('port');x.add_argument('--confirm',action='store_true')
     for name in ('list','audit','repair','watch','status'):subs.add_parser(name)
     try:
         if os.geteuid():raise Error('请使用 root')

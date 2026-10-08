@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# portbw Debian/Ubuntu zuizhongheji optional release: portbw-install.sh + portbw.py
+# portbw Debian/Ubuntu zuizhongheji optional TCP+UDP shared bandwidth release: portbw-install.sh + portbw.py
 # This entry point both bootstraps from GitHub and installs the program and units.
 # Never resets root qdisc, flushes foreign nft tables, or modifies node services.
 set -Eeuo pipefail
@@ -74,7 +74,7 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 if [[ ( "${SOURCE_SCRIPT##*/}" == portbw-install.sh || "${SOURCE_SCRIPT##*/}" == install.sh ) && -f "$SOURCE_SCRIPT" ]]; then
   SRC="$(cd -- "$(dirname -- "$SOURCE_SCRIPT")" && pwd -P)"
-  [[ -f "$SRC/portbw.py" ]] || die '本地缺少 portbw.py；将三个文件解压到同一目录'
+  [[ -f "$SRC/portbw.py" ]] || die '本地缺少 portbw.py；请与 portbw-install.sh 放在同一目录'
   log "使用本地源码：$SRC"
 else
   WORK="$(mktemp -d /var/tmp/portbw-src.XXXXXXXX)"
@@ -88,7 +88,7 @@ fi
 
 # Embedded manifest: only TWO executable files need to exist online.
 # The sha256 of portbw.py must change together with this value in the installer.
-EXPECTED_PORTBW_SHA256='364e3690615d1a05bffd631a19c35dde3c3bec88e6965e054340b3bcfe22a29b'
+EXPECTED_PORTBW_SHA256='489ffd94b8b6d25f02954e6ce0965cd382098f20155125aeaefb4a9fe3735c14'
 ACTUAL_PORTBW_SHA256="$(sha256sum "$SRC/portbw.py" | awk '{print $1}')"
 [[ "$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256" ]] || die "portbw.py SHA256 不符：实际 $ACTUAL_PORTBW_SHA256；为避免旧版混装已停止"
 python3 -B - "$SRC/portbw.py" <<'PY' || die 'portbw.py 语法校验失败'
