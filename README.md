@@ -328,6 +328,27 @@ vless_traffic 40002 --json
 
 从安装启用后开始记录，无法补回安装前的用量。统计按节点/端口归属，多人共用一个节点链接时会合并计算。流量包含 TCP 网络协议开销；每分钟采样的增量计入采样当天，因此跨午夜可能存在采样间隔内的日期归属误差。断电或外部清空统计计数器可能丢失尚未保存的增量。
 
+### 可选：TCP 端口独立限速
+
+#### 安装
+
+在 VLESS VPS 以 root 执行（独立安装，不影响已有节点）：
+
+```bash
+apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
+```
+
+#### 使用方法
+
+```bash
+portbw set 40001 10 20  # 40001：上传 10 Mbps，下载 20 Mbps
+portbw up 40001 15      # 修改上传限速
+portbw down 40001 30    # 修改下载限速
+portbw show 40001       # 查看端口状态
+portbw audit            # 检查所有限速规则
+portbw del 40001        # 仅取消该端口限速
+```
+
 ## 五、部署 WG-NAT
 
 WG-NAT 让 VLESS VPS 上的指定临时节点通过另一台机器的公网 IPv4 出口访问互联网。
