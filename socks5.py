@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.request
 import urllib.error
 from urllib.parse import quote
@@ -102,6 +103,23 @@ def nodes():
     ports=[n['port'] for n in result]
     if len(set(ports))!=len(ports): raise Fail('节点使用相同监听端口，拒绝管理')
     return result
+
+def resolve_node(reference):
+    """Public CLI accepts a managed local port or the legacy node ID.
+
+    Systemd/restore paths keep using immutable IDs. Never guess if a decimal
+    reference could name both a port and a different explicit account ID.
+    """
+    reference=str(reference)
+    if reference.isascii() and reference.isdecimal():
+        port=num(reference,'端口',1,65535)
+        matches=[n for n in nodes() if n['port']==port]
+        if nodefile(reference).exists() and (not matches or matches[0]['id']!=reference):
+            raise Fail(f'{reference} 同时可能是账号 ID 与端口；请使用非数字的账号 ID')
+        if not matches:raise Fail(f'未找到本机 SOCKS5 监听端口 {port} 对应的账号；运行 socks5 list 查看端口')
+        return matches[0]
+    return node(reference)
+
 
 @contextlib.contextmanager
 def locked(wait=90, nonblocking=False):
@@ -588,16 +606,145 @@ def nstate(n,expose=False,snaps=None):
     x={k:v for k,v in n.items() if k not in ('password','up_mbit','down_mbit')}
     q=x.get('quota')
     if q:
-        x['quota']={**q,'live_used':None,'remaining_estimate':max(0,q['original']-q['saved'])}
+        x['quota']={**q,'live_used':None,'realtime_available':False,'remaining_estimate':max(0,q['original']-q['saved'])}
         try:
             if not n['pending']:
                 used=live_bytes(n,snaps);x['quota']['live_used']=used
+                x['quota']['realtime_available']=True
                 x['quota']['remaining_estimate']=max(0,q['original']-q['saved']-used)
         except Fail:pass
     x['protection_ready']=ready(n,snaps)
     x['unit_active']=systemctl('is-active','--quiet',service(n),required=False) is not None
     if expose:x['password']=n['password']
     return x
+
+def human_bytes(value):
+    """IEC units for user display; quota enforcement always stays in bytes."""
+    if value is None:return '未知'
+    value=max(0,int(value))
+    if value<1024:return f'{value} B'
+    units=('KiB','MiB','GiB','TiB','PiB','EiB')
+    scale=1024
+    for unit in units:
+        if value < scale*1024 or unit==units[-1]:
+            return f'{Decimal(value)/Decimal(scale):.2f} {unit}'
+        scale*=1024
+
+
+def time_left(expires,now=None):
+    seconds=max(0,int(expires)-(int(time.time()) if now is None else now))
+    if seconds==0:return '已到期'
+    days,remainder=divmod(seconds,86400)
+    hours,remainder=divmod(remainder,3600)
+    minutes,_=divmod(remainder,60)
+    if days:return f'{days}天{hours}时'
+    if hours:return f'{hours}时{minutes}分'
+    if minutes:return f'{minutes}分'
+    return f'{seconds}秒'
+
+
+def pct_text(used,total):
+    if used is None or not total:return '-'
+    ratio=Decimal(used)*100/Decimal(total)
+    if 0<ratio<Decimal('0.01'):return f'{ratio:.4f}%'
+    return f'{ratio:.2f}%'
+
+
+def _display_width(value):
+    return sum(0 if unicodedata.combining(c) else (2 if unicodedata.east_asian_width(c) in 'WF' else 1)
+               for c in str(value))
+
+
+def render_table(headers,rows,right=()):
+    """Box-drawn fixed cells like vless_audit, without importing any VLESS files."""
+    rows=[[str(v) for v in row] for row in rows]
+    widths=[max(_display_width(header),*( _display_width(row[i]) for row in rows))
+            for i,header in enumerate(headers)]
+    def pad(value,index):
+        space=' '*max(0,widths[index]-_display_width(value))
+        return (space+value) if index in right else (value+space)
+    def border(left,mid,right_end):
+        return left+mid.join('━'*w for w in widths)+right_end
+    print(border('┏','┳','┓'))
+    print('┃'+'│'.join(v+' '*max(0,widths[i]-_display_width(v)) for i,v in enumerate(headers))+'┃')
+    print(border('┣','╋','┫'))
+    for j,row in enumerate(rows):
+        print('┃'+'│'.join(pad(v,i) for i,v in enumerate(row))+'┃')
+        if j!=len(rows)-1:print(border('┣','╋','┫'))
+    print(border('┗','┻','┛'))
+
+
+def quota_values(n,state):
+    """Return exact quota accounting only if its live nft counters were read."""
+    q=state['quota']
+    if q is None:return (None,None,None,None)
+    total=q['original']
+    if not q.get('realtime_available'):return (total,None,None,None)
+    used=min(total,q['saved']+q['live_used'])
+    return (total,used,max(0,total-used),pct_text(used,total))
+
+
+def show_quota(n,snaps=None):
+    state=nstate(n,snaps=snaps)
+    total,used,left,pct=quota_values(n,state)
+    print(f'本机端口：{n["port"]}  账号 ID：{n["id"]}')
+    if total is None:
+        print('总流量配额：不限流量（未设置配额）')
+        return
+    def val(v):return f'{human_bytes(v)} ({v:,} B)' if v is not None else '未知'
+    print(f'总配额：  {val(total)}')
+    print(f'已用流量：{val(used)}')
+    print(f'剩余流量：{val(left)}')
+    print(f'使用比例：{pct or "未知"}')
+    print(f'其中已持久化用量：{val(state["quota"]["saved"])}')
+    if used is None:
+        print('警告：未能读取实时 nftables 配额计数，剩余额度不可确认；请运行 socks5 status 排查防护。')
+    else:
+        print('计量方式：已保存配额用量 + 当前 nftables 实时计数（总配额，上传下载合计）')
+
+
+def list_accounts(selected=None,*,audit=False):
+    all_nodes=nodes()
+    if selected is not None:
+        chosen=resolve_node(selected)
+        all_nodes=[chosen]
+    if not all_nodes:
+        print('当前没有 SOCKS5 账号')
+        return
+    try:snaps=snapshot_pair()
+    except Fail:snaps=None
+    wide=shutil.get_terminal_size(fallback=(120,24)).columns>=105
+    if wide:
+        headers=['PORT','STATE','LIMIT','USED','LEFT','USE%','TTL','EXPIRE(BJ)','IP/STICKY','GUARD']
+        right={0,2,3,4,5,6,8}
+    else:
+        headers=['PORT','STATE','LIMIT','USED','LEFT','TTL','IP/STICKY','GUARD']
+        right={0,2,3,4,5,6}
+    data=[];issues=[]
+    now=int(time.time())
+    for n in sorted(all_nodes,key=lambda item:item['port']):
+        state=nstate(n,snaps=snaps)
+        total,used,left,pct=quota_values(n,state)
+        ok=state['protection_ready'] and state['unit_active'] and n['expires']>now
+        if not ok or (state['quota'] is not None and not state['quota'].get('realtime_available')):issues.append(n['port'])
+        status='正常' if ok else ('已到期' if n['expires']<=now else '异常')
+        guard='正常' if state['protection_ready'] else '异常'
+        t='不限' if total is None else human_bytes(total)
+        u='-' if total is None else human_bytes(used)
+        l='不限' if total is None else human_bytes(left)
+        ip=f'{n["ip_limit"]}/{n["sticky"]}s' if n['ip_limit'] else '不限'
+        ttl=time_left(n['expires'],now)
+        if wide:
+            expire=dt.datetime.fromtimestamp(n['expires'],dt.timezone(dt.timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+            data.append([n['port'],status,t,u,l,pct or '-',ttl,expire,ip,guard])
+        else:
+            data.append([n['port'],status,t,u,l,ttl,ip,guard])
+    render_table(headers,data,right)
+    print('说明：LIMIT=总配额  USED=已用  LEFT=剩余  TTL=剩余有效期  IP/STICKY=来源IP上限/占位秒数')
+    print('精确剩余字节数：socks5 quota 端口；完整连接链接：socks5 link 端口')
+    if audit and issues:
+        raise Fail('端口 '+', '.join(map(str,issues))+' 的运行状态、防护或有效期需要检查')
+
 
 def make_units():
     exe='/usr/local/sbin/socks5'
@@ -901,6 +1048,7 @@ def do_add(args):
                 print(f'用户名={n["username"]}\n密码={n["password"]}')
                 print(f'到期(北京时间)={dt.datetime.fromtimestamp(n["expires"],dt.timezone(dt.timedelta(hours=8))).isoformat()}')
                 print(f'IP_LIMIT={n["ip_limit"]}  STICKY={n["sticky"]}s')
+                print(f'日常直接使用端口 {n["port"]} 管理：socks5 quota {n["port"]}（查余额） / socks5 link {n["port"]}（取链接）')
                 print(f'需要限速请在独立 portbw 中执行：portbw set {n["port"]} <上传Mbps> <下载Mbps>')
                 print(f'SOCKS5连接链接：{connection_link(n)}')
                 return
@@ -1188,20 +1336,16 @@ def operate(args):
                 except Exception as e:errors.append(f'{n["id"]}: {e}')
             if errors:raise Fail('部分删除失败：'+'; '.join(errors))
         return
-    if action=='list':
-        try:snaps=snapshot_pair()
-        except Fail:snaps=None
-        for n in nodes():
-            x=nstate(n,snaps=snaps)
-            rem=x['quota']['remaining_estimate'] if x['quota'] else '∞'
-            print(f'{n["id"]:20} :{n["port"]:<5} out={n["public_host"]}:{n["public_port"]:<5} '
-                  f'ip={n["ip_limit"]}/{n["sticky"]}s  '
-                  f'remain={rem} B  expire={n["expires"]}  guard={x["protection_ready"]}  running={x["unit_active"]}')
-        return
-    if action=='show':
-        print(json.dumps(nstate(node(args.id),expose=args.credentials),indent=2,ensure_ascii=False));return
-    if action=='link':
-        print(connection_link(node(args.id)));return
+    if action in ('list','audit','show','link','quota','pq-show'):
+        with locked():
+            if action in ('list','audit'):
+                list_accounts(getattr(args,'id',None),audit=action=='audit');return
+            n=resolve_node(args.id)
+            if action=='show':
+                print(json.dumps(nstate(n,expose=args.credentials),indent=2,ensure_ascii=False));return
+            if action=='link':
+                print(connection_link(n));return
+            return show_quota(n)
     if action=='ddns-check':return ddns_check()
     if action=='ddns-set':return ddns_set(args)
     if action=='ddns-status':
@@ -1213,7 +1357,7 @@ def operate(args):
         return
     with locked():
         ensure_tables()
-        n=node(args.id)
+        n=resolve_node(args.id)
         if action=='del':return do_del(n)
         if action=='ip-set':
             limit=num(args.ip_limit,'IP_LIMIT',1,65535)
@@ -1320,12 +1464,14 @@ def parser():
     p.add_argument('--public-port',type=int);p.add_argument('--host')
     p.add_argument('--connections',default='64');p.add_argument('--maxconn',default='128')
     p.add_argument('--max-start-retries',default=os.getenv('MAX_START_RETRIES','12'))
-    for name in ('list','status','save','gc','reset','watch','restore','ddns-check','ddns-status'):sub.add_parser(name)
+    for name in ('status','save','gc','reset','watch','restore','ddns-check','ddns-status'):sub.add_parser(name)
+    sub.add_parser('list')
+    p=sub.add_parser('audit');p.add_argument('id',nargs='?',help='可选：本机监听端口或账号 ID')
     p=sub.add_parser('clear');p.add_argument('--confirm',action='store_true')
     p=sub.add_parser('ddns-set')
     p.add_argument('--zone-id',required=True);p.add_argument('--record-id',required=True)
     p.add_argument('--name',required=True);p.add_argument('--token-file',required=True)
-    for name in ('show','link','del','run','stop-post','ip-del','ip-show','pq-del'):
+    for name in ('show','link','quota','pq-show','del','run','stop-post','ip-del','ip-show','pq-del'):
         p=sub.add_parser(name);p.add_argument('id')
         if name=='show':p.add_argument('--credentials',action='store_true')
     p=sub.add_parser('ip-set');p.add_argument('id');p.add_argument('ip_limit');p.add_argument('sticky',nargs='?')

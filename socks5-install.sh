@@ -31,8 +31,8 @@ if [[ "$ACTION" != deps ]];then
     SRC_DIR="$FETCH_DIR"
     echo '[socks5] 从 zuizhongheji/main 下载 SOCKS5 两个主体文件...'
   fi
-  expected_core="b1f8e90396649160dbd81e3366a7dc6f1c28c09f1b94caa3e17ba07182e15711"
-  expected_traffic="3c0a882871903d71e74953f46d3181191c84d38bfd08f71a9333dcfed1291dbd"
+  expected_core="555c06f91a5b76135d5ed0c87e10d21d0426971d9fb1855baa75dcd6382b638c"
+  expected_traffic="134bcd2a2ee8947bcad3bad09c6f0d50ea5474249701758c514a2294274deb23"
   actual_core="$(sha256sum "$SRC_DIR/socks5.py" | awk '{print $1}')"
   actual_traffic="$(sha256sum "$SRC_DIR/socks5-traffic.py" | awk '{print $1}')"
   [[ "$actual_core" == "$expected_core" ]] || { echo 'socks5.py SHA256 不匹配；停止安装' >&2;exit 1; }

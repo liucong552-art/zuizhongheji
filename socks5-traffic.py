@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import sys
 import uuid
-from socks5 import STATE, UNITDIR, atomic_json, atomic_write, load, nodes, locked, cmd, Fail
+from socks5 import STATE, UNITDIR, atomic_json, atomic_write, load, nodes, locked, cmd, Fail, render_table
 
 TABLE='s5m_daily'
 TZ=dt.timezone(dt.timedelta(hours=8),'Asia/Shanghai')
@@ -142,12 +142,15 @@ def display(state,selector=None,as_json=False):
     today=dt.datetime.now(TZ).date().isoformat()
     print('每日流量统计 | 北京时间 | '+('今日 '+today if selector is None else '最近 30 天'))
     if not vals:print('当前无有效客户');return
-    print(f'{"ID":20} {"PORT":>5} {"DATE":10} {"UP":>12} {"DOWN":>12} {"TOTAL":>12}')
-    for v in vals:
+    rows=[]
+    for v in sorted(vals,key=lambda item:item['port']):
         for day,record in sorted(v.get('days',{}).items(),reverse=True):
             if selector is None and day!=today:continue
             up=record['upload'];down=record['download']
-            print(f'{v["id"][:20]:20} {v["port"]:5} {day:10} {pretty(up):>12} {pretty(down):>12} {pretty(up+down):>12}')
+            rows.append([v['port'],day,pretty(up),pretty(down),pretty(up+down)])
+    if rows:render_table(['PORT','DATE(BJ)','UPLOAD','DOWNLOAD','TOTAL'],rows,right={0,2,3,4})
+    else:print('暂无采集数据（启用后每分钟采集一次）')
+    print('说明：本表是每日流量历史；总配额/实时剩余请使用 socks5 quota 端口')
 
 
 def install():
