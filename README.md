@@ -592,7 +592,7 @@ bash /root/nat.sh status
 
 ## 八、可选：独立 SOCKS5 代理（3proxy）
 
-在**单独的 Debian 12 家宽主机**上使用 `root` 安装，与 VLESS VPS 分开部署。
+在**单独的家宽主机**上使用 `root` 安装，与 VLESS VPS 分开部署。**Debian 12 已完成真机验收；Debian 13、Ubuntu 22.04/24.04 LTS 从代码依赖来看有望兼容，但尚未在这些系统上完成真机验证。**建议优先使用已验收的 Debian 12。
 
 ### 安装 / 更新
 
