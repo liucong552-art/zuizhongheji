@@ -619,7 +619,7 @@ AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/
 
 #### 按分钟
 
-创建有效期 **30 分钟**、最多 1 个来源 IP、总流量 **1 GiB** 的账号：
+创建有效期 **30 分钟**、最多 **1 个来源 IP**、**IP 占位时间 60 秒（1 分钟）**、总流量 **1 GiB** 的账号：
 
 ```bash
 MINUTES=30; IP_LIMIT=1 IP_STICKY_SECONDS=60 PQ_GIB=1 D=$((MINUTES*60)) socks5 add
@@ -627,7 +627,7 @@ MINUTES=30; IP_LIMIT=1 IP_STICKY_SECONDS=60 PQ_GIB=1 D=$((MINUTES*60)) socks5 ad
 
 #### 按小时
 
-创建有效期 **2 小时**、最多 2 个来源 IP、总流量 **5 GiB** 的账号：
+创建有效期 **2 小时**、最多 **2 个来源 IP**、**IP 占位时间 300 秒（5 分钟）**、总流量 **5 GiB** 的账号：
 
 ```bash
 HOURS=2; IP_LIMIT=2 IP_STICKY_SECONDS=300 PQ_GIB=5 D=$((HOURS*60*60)) socks5 add
@@ -635,7 +635,7 @@ HOURS=2; IP_LIMIT=2 IP_STICKY_SECONDS=300 PQ_GIB=5 D=$((HOURS*60*60)) socks5 add
 
 #### 按天
 
-创建有效期 **7 天**、最多 3 个来源 IP、总流量 **50 GiB** 的账号：
+创建有效期 **7 天**、最多 **3 个来源 IP**、**IP 占位时间 600 秒（10 分钟）**、总流量 **50 GiB** 的账号：
 
 ```bash
 DAYS=7; IP_LIMIT=3 IP_STICKY_SECONDS=600 PQ_GIB=50 D=$((DAYS*24*60*60)) socks5 add
@@ -643,7 +643,7 @@ DAYS=7; IP_LIMIT=3 IP_STICKY_SECONDS=600 PQ_GIB=50 D=$((DAYS*24*60*60)) socks5 a
 
 #### 固定端口 / 指定账号 ID
 
-创建一个有效期 **1 小时**、固定监听端口 `41004` 的账号：
+创建有效期 **1 小时**、最多 **1 个来源 IP**、**IP 占位时间 60 秒（1 分钟）**、总流量 **1 GiB**、固定监听端口 `41004` 的账号：
 
 ```bash
 HOURS=1; IP_LIMIT=1 IP_STICKY_SECONDS=60 PQ_GIB=1 PORT=41004 id=myproxy D=$((HOURS*60*60)) socks5 add
