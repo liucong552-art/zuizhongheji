@@ -653,14 +653,15 @@ HOURS=1; IP_LIMIT=1 IP_STICKY_SECONDS=60 PORT=41004 D=$((HOURS*3600)) socks5 add
 
 ### 3. 按端口查看账号、剩余流量和连接链接
 
+日常查看使用 `socks5 list` 即可，一张表看清端口、流量余额、IP 占用、剩余有效期和防护状态。
+
 ```bash
-socks5 list                         # 对齐表格：端口、剩余流量、IP当前占用/上限、占位时间、防护
-socks5 audit                        # 与 list 一样显示表格；发现异常时返回错误
-socks5 audit 41004                  # 只检查端口 41004
-socks5 quota 41004                  # 最重要：查看 41004 总配额、已用、剩余（包括精确字节数）
-socks5 link 41004                   # 输出完整 socks5:// 连接链接
-socks5 show 41004 --credentials     # 详细 JSON、用户名和密码
-socks5 status                       # 运行状态与出口网卡
+socks5 list                         # 查看全部账号的对齐表格（含实时剩余流量及 IP 占用）
+socks5 quota 41004                  # 查看端口 41004 的总配额、已用、剩余及精确字节数
+socks5 link 41004                   # 获取端口 41004 的完整 socks5:// 连接链接
+socks5 show 41004 --credentials     # 查看账号详细信息、用户名和密码（JSON）
+socks5 status                       # 查看出口网卡、路由与代理服务状态
+socks5 watch                        # 手动检查并恢复防护规则或异常服务
 ```
 
 表格说明：`LIMIT`=总配额，`USED`=已用，**`LEFT`=实时剩余额度**，`USE%`=使用比例，`TTL`=剩余有效期，`EXPIRE(BJ)`=北京时间到期日期，`IP占用`=当前有效占位 IP 数/允许上限（例如 **2/3** 表示最多允许 3 个来源 IP，目前占用了 2 个名额），`STICKY`=IP 停止活动后的占位释放秒数。若实时 nftables 计数无法读取，`LEFT` 会显示 **未知**，不会把缓存值误当实时余额。**IP占用统计的是仍在占位期内的不同来源 IP，不是实时建立的 TCP 连接数；读取失败显示 ?/上限，而不是错误显示为零。** 窄终端会隐藏部分列，精确字节数请用 `socks5 quota 41004`。
@@ -684,10 +685,8 @@ socks5 del 41004                    # 删除本机端口 41004 对应的 SOCKS5 
 
 ```bash
 socks5-traffic --install            # 首次开启或更新每日流量采集
-socks5-traffic                      # 按端口显示今天上传/下载流量
-socks5-traffic 41004                # 查看端口 41004 最近 30 天的每日流量
-socks5-traffic 41004 --json         # JSON 格式
-socks5 watch                        # 手动检查和恢复防护
+socks5-traffic                      # 查看所有端口今天的上传/下载用量
+socks5-traffic 41004                # 查看端口 41004 最近 30 天的每日用量
 ```
 
 每日统计按约每分钟采样的增量记录；不能把每日流量直接当作实时剩余配额。
@@ -698,11 +697,11 @@ socks5 watch                        # 手动检查和恢复防护
 
 ```bash
 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
-portbw set 41004 10 20              # 上传 10 Mbps，下载 20 Mbps
-portbw show 41004
-portbw list
-portbw audit
-portbw del 41004                    # 只删除限速，不删除 SOCKS5 账号
+portbw set 41004 10 20              # 为 41004 设置上传 10 Mbps、下载 20 Mbps
+portbw show 41004                   # 查看 41004 的限速及 NFT/TC 是否正常生效
+portbw list                         # 列出全部端口的限速配置和运行状态
+portbw audit                        # 检查所有限速规则；若有异常，返回错误状态
+portbw del 41004                    # 只取消 41004 的限速，不删除 SOCKS5 账号
 ```
 
 SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按原有方式管理 TCP+UDP。SOCKS5 的创建、修改、到期和删除都不会增删修改 `portbw` 规则。
