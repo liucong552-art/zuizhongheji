@@ -588,3 +588,81 @@ bash /root/nat.sh status
 ---
 
 请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。
+
+
+## 八、可选：独立 SOCKS5 代理（3proxy）
+
+在**单独的 Debian 12 家宽主机**上使用 `root` 安装，与 VLESS VPS 分开部署。
+
+### 安装 / 更新
+
+```bash
+apt-get update && apt-get install -y curl ca-certificates
+AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/socks5-install.sh') install
+```
+
+如果家宽主机在路由器 NAT 后面，改用以下命令指定公网入口（把域名换成自己的）：
+
+```bash
+AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/socks5-install.sh') install --host proxy.example.com
+```
+
+安装器自动识别出口网卡；需要指定时可在 `install` 后附加 `--wan-if eth0`（将 `eth0` 换成实际网卡）。更新时重新运行安装命令即可。
+
+### 创建和管理账号
+
+```bash
+# 创建一个有效期 1 小时、最多 1 个来源 IP、1 GiB 配额的账号
+socks5 add --seconds 3600 --port 41004 --ip-limit 1 --sticky 600 --quota-gib 1
+
+# 自动挑选空闲端口、不设置总流量配额
+socks5 add --seconds 86400
+
+# 查看账号及连接信息（ID 换成实际账号 ID）
+socks5 list
+socks5 show ID --credentials
+socks5 status
+
+# 修改来源 IP 限制和总流量配额
+socks5 ip-show ID
+socks5 ip-set ID 2 300
+socks5 ip-del ID
+socks5 pq-set ID 5 --confirm-reset
+socks5 pq-del ID
+
+# 删除指定账号
+socks5 del ID
+```
+
+账号用户名和密码在创建时自动生成。未指定 `--port` 时，自动选择本机空闲端口；未指定 `--quota-gib` 时，不限制累计流量。`pq-set` 会重置该账号的已用配额。
+
+家宽主机位于路由器后时，需要在路由器中把**外部 TCP 端口映射到家宽主机的 SOCKS5 监听端口**。如果公网端口和本地监听端口不同，创建账号时加 `--public-port`；也可加 `--host` 指定该账号对外显示的域名或公网 IP，例如：
+
+```bash
+socks5 add --seconds 86400 --port 41004 --host proxy.example.com --public-port 51004
+```
+
+### 可选：每日流量统计（保留最近 30 天）
+
+```bash
+socks5-traffic --install
+socks5-traffic                   # 查看各账号当天流量
+socks5-traffic ID                # 查看指定账号最近 30 天的流量
+socks5-traffic ID --json         # 以 JSON 显示
+socks5 watch                     # 手动检查和恢复防护
+```
+
+### 可选：按端口限速（原有 portbw）
+
+若需要限速，**在 SOCKS5 所在的家宽主机上**安装原有 `portbw`，再手动设置监听端口的速度：
+
+```bash
+bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
+portbw set 41004 10 20           # 上传 10 Mbps，下载 20 Mbps
+portbw show 41004
+portbw list
+portbw audit
+portbw del 41004                 # 只删除限速，不删除 SOCKS5 账号
+```
+
+SOCKS5 账号的创建、到期和删除**不会自动修改 `portbw` 策略**。SOCKS5 仅支持 TCP CONNECT，不提供 UDP ASSOCIATE；端口限速程序仍独立按原有方式管理 TCP+UDP 流量。
