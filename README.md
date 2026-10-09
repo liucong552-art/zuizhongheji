@@ -654,7 +654,7 @@ HOURS=1; IP_LIMIT=1 IP_STICKY_SECONDS=60 PORT=41004 D=$((HOURS*3600)) socks5 add
 ### 3. 按端口查看账号、剩余流量和连接链接
 
 ```bash
-socks5 list                         # 对齐表格：端口、运行状态、总配额、已用、剩余、有效期、IP限制、防护
+socks5 list                         # 对齐表格：端口、剩余流量、IP当前占用/上限、占位时间、防护
 socks5 audit                        # 与 list 一样显示表格；发现异常时返回错误
 socks5 audit 41004                  # 只检查端口 41004
 socks5 quota 41004                  # 最重要：查看 41004 总配额、已用、剩余（包括精确字节数）
@@ -663,14 +663,14 @@ socks5 show 41004 --credentials     # 详细 JSON、用户名和密码
 socks5 status                       # 运行状态与出口网卡
 ```
 
-表格说明：`LIMIT`=总配额，`USED`=已用，**`LEFT`=实时剩余额度**，`USE%`=使用比例，`TTL`=剩余有效期，`EXPIRE(BJ)`=北京时间到期日期，`IP/STICKY`=来源 IP 上限/占位秒数。若实时 nftables 计数无法读取，`LEFT` 会显示 **未知**，不会把缓存值误当实时余额。窄终端会隐藏部分列，精确金额请用 `socks5 quota 41004`。
+表格说明：`LIMIT`=总配额，`USED`=已用，**`LEFT`=实时剩余额度**，`USE%`=使用比例，`TTL`=剩余有效期，`EXPIRE(BJ)`=北京时间到期日期，`IP占用`=当前有效占位 IP 数/允许上限（例如 **2/3** 表示最多允许 3 个来源 IP，目前占用了 2 个名额），`STICKY`=IP 停止活动后的占位释放秒数。若实时 nftables 计数无法读取，`LEFT` 会显示 **未知**，不会把缓存值误当实时余额。**IP占用统计的是仍在占位期内的不同来源 IP，不是实时建立的 TCP 连接数；读取失败显示 ?/上限，而不是错误显示为零。** 窄终端会隐藏部分列，精确字节数请用 `socks5 quota 41004`。
 
 `socks5-traffic` 每日统计**不等于**总流量配额；剩余可用配额以 `socks5 quota` 查询为准。
 
 ### 4. 按端口修改、删除账号
 
 ```bash
-socks5 ip-show 41004                # 查看当前占位来源 IP
+socks5 ip-show 41004                # 查看当前占位数量、具体来源 IP 和剩余占位时间
 socks5 ip-set 41004 2 60            # 最多 2 个来源 IP，闲置占位 60 秒（重置已有占位记录）
 socks5 ip-del 41004                 # 取消来源 IP 数量限制
 socks5 pq-set 41004 5 --confirm-reset  # 重新设置 5 GiB 总配额，已用量从零开始

@@ -288,6 +288,40 @@ def named_object(snapshot,kind,name):
         if isinstance(value,dict) and value.get('name')==name:return value
     return None
 
+def occupied_ip_slots(n, ip_snapshot):
+    """Count unexpired source-IP slots from the kernel nftables set snapshot.
+
+    A slot is a recently active distinct source IP, not a live TCP session.
+    Return None when the set/JSON is unavailable, never incorrectly report 0.
+    """
+    if not n['ip_limit']:return None
+    if not isinstance(ip_snapshot,list):return None
+    obj=named_object(ip_snapshot,'set',ip_name(n['port']))
+    if not isinstance(obj,dict):return None
+    members=obj.get('elem',[])
+    if not isinstance(members,list):return None
+    count=0
+    for element in members:
+        # nft JSON may return bare addresses or {"elem": {"val": addr,
+        # "expires": milliseconds}} for timeout/dynamic sets.
+        info=element.get('elem') if isinstance(element,dict) else element
+        if isinstance(info,dict):
+            addr=info.get('val')
+            remaining=info.get('expires')
+        else:
+            addr=info
+            remaining=None
+        if not isinstance(addr,str):return None
+        try:ipaddress.IPv4Address(addr)
+        except ipaddress.AddressValueError:return None
+        if remaining is not None:
+            if not isinstance(remaining,(int,float)) or isinstance(remaining,bool):return None
+            if remaining<=0:continue
+        count+=1
+    if count>n['ip_limit']:return None
+    return count
+
+
 def _nft_match(expr, left, right, *, ops=('==',)):
     """Match one whole nft JSON comparison; never trust rule comments alone."""
     if not isinstance(expr,dict) or set(expr)!={'match'}:return False
@@ -614,6 +648,12 @@ def nstate(n,expose=False,snaps=None):
                 x['quota']['remaining_estimate']=max(0,q['original']-q['saved']-used)
         except Fail:pass
     x['protection_ready']=ready(n,snaps)
+    x['ip_active']=None
+    if n['ip_limit']:
+        try:
+            ip_snap=snaps[TABLE_IP] if snaps is not None else nft_table(TABLE_IP)
+            x['ip_active']=occupied_ip_slots(n,ip_snap)
+        except (Fail,KeyError,TypeError):pass
     x['unit_active']=systemctl('is-active','--quiet',service(n),required=False) is not None
     if expose:x['password']=n['password']
     return x
@@ -715,11 +755,11 @@ def list_accounts(selected=None,*,audit=False):
     except Fail:snaps=None
     wide=shutil.get_terminal_size(fallback=(120,24)).columns>=105
     if wide:
-        headers=['PORT','STATE','LIMIT','USED','LEFT','USE%','TTL','EXPIRE(BJ)','IP/STICKY','GUARD']
-        right={0,2,3,4,5,6,8}
+        headers=['PORT','STATE','LIMIT','USED','LEFT','USE%','TTL','EXPIRE(BJ)','IP占用','STICKY','GUARD']
+        right={0,2,3,4,5,6,8,9}
     else:
-        headers=['PORT','STATE','LIMIT','USED','LEFT','TTL','IP/STICKY','GUARD']
-        right={0,2,3,4,5,6}
+        headers=['PORT','STATE','LIMIT','USED','LEFT','TTL','IP占用','STICKY','GUARD']
+        right={0,2,3,4,5,6,7}
     data=[];issues=[]
     now=int(time.time())
     for n in sorted(all_nodes,key=lambda item:item['port']):
@@ -732,15 +772,18 @@ def list_accounts(selected=None,*,audit=False):
         t='不限' if total is None else human_bytes(total)
         u='-' if total is None else human_bytes(used)
         l='不限' if total is None else human_bytes(left)
-        ip=f'{n["ip_limit"]}/{n["sticky"]}s' if n['ip_limit'] else '不限'
+        occupied=state.get('ip_active')
+        ip=f'{occupied if occupied is not None else "?"}/{n["ip_limit"]}' if n['ip_limit'] else '不限'
+        sticky=f'{n["sticky"]}s' if n['ip_limit'] else '-'
         ttl=time_left(n['expires'],now)
         if wide:
             expire=dt.datetime.fromtimestamp(n['expires'],dt.timezone(dt.timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
-            data.append([n['port'],status,t,u,l,pct or '-',ttl,expire,ip,guard])
+            data.append([n['port'],status,t,u,l,pct or '-',ttl,expire,ip,sticky,guard])
         else:
-            data.append([n['port'],status,t,u,l,ttl,ip,guard])
+            data.append([n['port'],status,t,u,l,ttl,ip,sticky,guard])
     render_table(headers,data,right)
-    print('说明：LIMIT=总配额  USED=已用  LEFT=剩余  TTL=剩余有效期  IP/STICKY=来源IP上限/占位秒数')
+    print('说明：LIMIT=总配额  USED=已用  LEFT=剩余  TTL=剩余有效期  IP占用=当前占位来源IP数/允许上限  STICKY=无活动后释放秒数')
+    print('IP占用是 nftables 的有效占位数，不等于当前已建立 TCP 连接数；? 表示读取不到实时占位。')
     print('精确剩余字节数：socks5 quota 端口；完整连接链接：socks5 link 端口')
     if audit and issues:
         raise Fail('端口 '+', '.join(map(str,issues))+' 的运行状态、防护或有效期需要检查')
@@ -1369,6 +1412,10 @@ def operate(args):
         if action=='ip-show':
             if not n['ip_limit']:
                 print('未启用 IP 限制');return
+            try:count=occupied_ip_slots(n,nft_table(TABLE_IP))
+            except Fail:count=None
+            print(f'端口 {n["port"]} 来源 IP 占用：{count if count is not None else "未知"}/{n["ip_limit"]}，占位超时 {n["sticky"]} 秒')
+            print('说明：这是最近活动 IP 的有效占位数，不等于实时 TCP 连接数。')
             print(cmd(['nft','list','set','inet',TABLE_IP,ip_name(n['port'])]));return
         if action=='pq-set':
             if not args.confirm_reset:raise Fail('pq-set 会重置已用量及 30 天重置周期；必须加 --confirm-reset')
