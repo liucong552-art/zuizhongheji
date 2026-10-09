@@ -22,6 +22,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+from urllib.parse import quote
 from decimal import Decimal, InvalidOperation
 
 STATE = Path(os.getenv('S5_STATE', '/var/lib/socks5-manager'))
@@ -130,6 +131,13 @@ def gib_bytes(value):
     if not n.is_finite() or b<1 or b>Decimal('9000000000000000000') or b!=int(b):
         raise Fail('PQ_GIB 必须是正数，换算后为整数字节，且不能溢出')
     return int(b)
+
+def connection_link(n):
+    """Create a portable URI for clients that support socks5:// imports."""
+    # Quote credentials so the URI stays valid even if account generation changes.
+    user = quote(n['username'], safe='')
+    password = quote(n['password'], safe='')
+    return f'socks5://{user}:{password}@{n["public_host"]}:{n["public_port"]}'
 
 def public_host(s):
     if not s or not re.fullmatch(r'[A-Za-z0-9._-]{1,253}',s): raise Fail('公网地址/域名格式错误')
@@ -894,6 +902,7 @@ def do_add(args):
                 print(f'到期(北京时间)={dt.datetime.fromtimestamp(n["expires"],dt.timezone(dt.timedelta(hours=8))).isoformat()}')
                 print(f'IP_LIMIT={n["ip_limit"]}  STICKY={n["sticky"]}s')
                 print(f'需要限速请在独立 portbw 中执行：portbw set {n["port"]} <上传Mbps> <下载Mbps>')
+                print(f'SOCKS5连接链接：{connection_link(n)}')
                 return
             except Exception as problem:
                 try:rollback_new(n)
@@ -1191,6 +1200,8 @@ def operate(args):
         return
     if action=='show':
         print(json.dumps(nstate(node(args.id),expose=args.credentials),indent=2,ensure_ascii=False));return
+    if action=='link':
+        print(connection_link(node(args.id)));return
     if action=='ddns-check':return ddns_check()
     if action=='ddns-set':return ddns_set(args)
     if action=='ddns-status':
@@ -1314,7 +1325,7 @@ def parser():
     p=sub.add_parser('ddns-set')
     p.add_argument('--zone-id',required=True);p.add_argument('--record-id',required=True)
     p.add_argument('--name',required=True);p.add_argument('--token-file',required=True)
-    for name in ('show','del','run','stop-post','ip-del','ip-show','pq-del'):
+    for name in ('show','link','del','run','stop-post','ip-del','ip-show','pq-del'):
         p=sub.add_parser(name);p.add_argument('id')
         if name=='show':p.add_argument('--credentials',action='store_true')
     p=sub.add_parser('ip-set');p.add_argument('id');p.add_argument('ip_limit');p.add_argument('sticky',nargs='?')

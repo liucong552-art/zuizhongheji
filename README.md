@@ -594,75 +594,112 @@ bash /root/nat.sh status
 
 在**单独的家宽主机**上使用 `root` 安装，与 VLESS VPS 分开部署。**Debian 12 已完成真机验收；Debian 13、Ubuntu 22.04/24.04 LTS 从代码依赖来看有望兼容，但尚未在这些系统上完成真机验证。**建议优先使用已验收的 Debian 12。
 
-### 安装 / 更新
+### 1. 安装 / 更新
+
+在 SOCKS5 所在的家宽主机执行：
 
 ```bash
 apt-get update && apt-get install -y curl ca-certificates
 AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/socks5-install.sh') install
 ```
 
-如果家宽主机在路由器 NAT 后面，改用以下命令指定公网入口（把域名换成自己的）：
+家宽主机如果在路由器 NAT 后面，安装时可以指定对外使用的域名或公网 IPv4（替换示例域名）：
 
 ```bash
 AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/socks5-install.sh') install --host proxy.example.com
 ```
 
-安装器自动识别出口网卡；需要指定时可在 `install` 后附加 `--wan-if eth0`（将 `eth0` 换成实际网卡）。更新时重新运行安装命令即可。
+安装器会自动识别出口网卡；确需手动指定时，可在 `install` 后添加 `--wan-if eth0`（按实际网卡修改）。以后更新重新执行安装命令即可。
 
-### 创建和管理账号
+### 2. 创建临时 SOCKS5 账号
 
-```bash
-# 创建一个有效期 1 小时、最多 1 个来源 IP、1 GiB 配额的账号
-socks5 add --seconds 3600 --port 41004 --ip-limit 1 --sticky 600 --quota-gib 1
+账号用户名、密码会自动生成，**创建成功的输出最后一行就是完整的 `socks5://` 连接链接**。部分客户端支持直接导入链接；不支持的客户端选择 SOCKS5，手动填写服务器、端口、用户名和密码。此代理仅支持 TCP CONNECT，不提供 UDP ASSOCIATE。
 
-# 自动挑选空闲端口、不设置总流量配额
-socks5 add --seconds 86400
+与上面的 VLESS 临时节点一样，直接修改命令中的数字即可：`IP_LIMIT` 表示最多允许的来源 IP 数量，`IP_STICKY_SECONDS` 表示一个来源 IP 的占位时间（秒），`PQ_GIB` 表示双向总流量配额（GiB），`MINUTES` / `HOURS` / `DAYS` 表示账号有效期。**`IP_STICKY_SECONDS=600` 只是 10 分钟的示例，不是固定值**；例如设为 `60` 是 1 分钟，设为 `300` 是 5 分钟。活跃 IP 发起匹配的 TCP 流量会刷新其占位超时；占位到期后名额可以分配给其他来源 IP，不是强制断开已建立的连接。省略 `PORT` 会自动选择空闲监听端口。
 
-# 查看账号及连接信息（ID 换成实际账号 ID）
-socks5 list
-socks5 show ID --credentials
-socks5 status
+#### 按分钟
 
-# 修改来源 IP 限制和总流量配额
-socks5 ip-show ID
-socks5 ip-set ID 2 300
-socks5 ip-del ID
-socks5 pq-set ID 5 --confirm-reset
-socks5 pq-del ID
-
-# 删除指定账号
-socks5 del ID
-```
-
-账号用户名和密码在创建时自动生成。未指定 `--port` 时，自动选择本机空闲端口；未指定 `--quota-gib` 时，不限制累计流量。`pq-set` 会重置该账号的已用配额。
-
-家宽主机位于路由器后时，需要在路由器中把**外部 TCP 端口映射到家宽主机的 SOCKS5 监听端口**。如果公网端口和本地监听端口不同，创建账号时加 `--public-port`；也可加 `--host` 指定该账号对外显示的域名或公网 IP，例如：
+创建有效期 **30 分钟**、最多 1 个来源 IP、总流量 **1 GiB** 的账号：
 
 ```bash
-socks5 add --seconds 86400 --port 41004 --host proxy.example.com --public-port 51004
+MINUTES=30; IP_LIMIT=1 IP_STICKY_SECONDS=60 PQ_GIB=1 D=$((MINUTES*60)) socks5 add
 ```
 
-### 可选：每日流量统计（保留最近 30 天）
+#### 按小时
+
+创建有效期 **2 小时**、最多 2 个来源 IP、总流量 **5 GiB** 的账号：
 
 ```bash
-socks5-traffic --install
-socks5-traffic                   # 查看各账号当天流量
-socks5-traffic ID                # 查看指定账号最近 30 天的流量
-socks5-traffic ID --json         # 以 JSON 显示
-socks5 watch                     # 手动检查和恢复防护
+HOURS=2; IP_LIMIT=2 IP_STICKY_SECONDS=300 PQ_GIB=5 D=$((HOURS*60*60)) socks5 add
 ```
 
-### 可选：按端口限速（原有 portbw）
+#### 按天
 
-若需要限速，**在 SOCKS5 所在的家宽主机上**安装原有 `portbw`，再手动设置监听端口的速度：
+创建有效期 **7 天**、最多 3 个来源 IP、总流量 **50 GiB** 的账号：
+
+```bash
+DAYS=7; IP_LIMIT=3 IP_STICKY_SECONDS=600 PQ_GIB=50 D=$((DAYS*24*60*60)) socks5 add
+```
+
+#### 固定端口 / 指定账号 ID
+
+创建一个有效期 **1 小时**、固定监听端口 `41004` 的账号：
+
+```bash
+HOURS=1; IP_LIMIT=1 IP_STICKY_SECONDS=60 PQ_GIB=1 PORT=41004 id=myproxy D=$((HOURS*60*60)) socks5 add
+```
+
+`id=myproxy` 可以省略，省略后自动生成 ID。`IP_LIMIT=0` 表示不限制来源 IP；不需要总流量配额时删除 `PQ_GIB=...` 即可。`IP_STICKY_SECONDS` 可按需自由修改；设置 `IP_LIMIT=0` 时它不会限制来源 IP 个数。也可以使用等价的参数写法，例如 `socks5 add --seconds 3600 --ip-limit 2 --sticky 60 --quota-gib 5`。
+
+如果家宽主机在路由器后面，需要在路由器上将**公网 TCP 端口**映射到本地 SOCKS5 监听端口。若公网端口和本地端口不同，可以这样创建：
+
+```bash
+HOURS=1; IP_LIMIT=1 IP_STICKY_SECONDS=60 PORT=41004 D=$((HOURS*60*60)) socks5 add --host proxy.example.com --public-port 51004
+```
+
+这样对外连接端口显示为 `51004`，但本机仍监听 `41004`。需要提前设置路由器端口映射。
+
+### 3. 查看连接链接、管理和删除账号
+
+```bash
+socks5 list                        # 查看全部账号和 ID
+socks5 link ID                     # 只输出该账号的 socks5:// 连接链接
+socks5 show ID --credentials       # 查看账号信息、用户名和密码
+socks5 status                      # 查看运行与防护状态
+
+socks5 ip-show ID                  # 查看占用的来源 IP
+socks5 ip-set ID 2 60              # 改为最多 2 个来源 IP，IP 占位 60 秒（已建账号也能修改）
+socks5 ip-del ID                   # 取消 IP 数量限制
+
+socks5 pq-set ID 5 --confirm-reset # 改为 5 GiB 总配额，并重置已用量
+socks5 pq-del ID                   # 取消总流量配额
+
+socks5 del ID                      # 删除指定账号
+```
+
+将 `ID` 换成创建时打印的实际账号 ID。连接链接包含用户名和密码，请妥善保管。账号到期后会自动清理，原链接随之失效。
+
+### 4. 可选：每日流量统计（保留最近 30 天）
+
+```bash
+socks5-traffic --install           # 首次启用或更新每日流量采集
+socks5-traffic                     # 查看各账号当天流量
+socks5-traffic ID                  # 查看指定账号最近 30 天的每日流量
+socks5-traffic ID --json           # 用 JSON 格式查看
+socks5 watch                       # 手动检查和恢复防护
+```
+
+### 5. 可选：按端口限速（原有 portbw）
+
+若需要限速，**在 SOCKS5 实际运行的家宽主机上**独立安装 `portbw`，然后手动设置对应端口的上传/下载速度：
 
 ```bash
 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
-portbw set 41004 10 20           # 上传 10 Mbps，下载 20 Mbps
-portbw show 41004
-portbw list
-portbw audit
-portbw del 41004                 # 只删除限速，不删除 SOCKS5 账号
+portbw set 41004 10 20             # 上传 10 Mbps，下载 20 Mbps
+portbw show 41004                  # 查看该端口限速
+portbw list                        # 查看所有限速
+portbw audit                       # 检查限速状态
+portbw del 41004                   # 仅删除限速，不删除 SOCKS5 账号
 ```
 
-SOCKS5 账号的创建、到期和删除**不会自动修改 `portbw` 策略**。SOCKS5 仅支持 TCP CONNECT，不提供 UDP ASSOCIATE；端口限速程序仍独立按原有方式管理 TCP+UDP 流量。
+SOCKS5 账号创建、到期和删除**不会自动修改 `portbw` 策略**，两者独立管理。
