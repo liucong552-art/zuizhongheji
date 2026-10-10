@@ -333,6 +333,14 @@ vless_traffic 40002 --json
 
 此组件与 VLESS 节点管理、流量统计、WG-NAT 相互独立：**按本机监听端口限速，不绑定节点配置**。TCP 和 UDP 使用同一个端口时，二者在**上传方向合计使用一个额度**，在**下载方向合计使用另一个额度**；IPv4 和 IPv6 也共用各自方向的同一额度，不是每种协议分别限速。实际速度可能因协议开销、丢包和瞬时突发略有波动。
 
+#### 一键查询全部端口限速
+
+```bash
+portbw report           # 一键查看所有静态、自动限速端口（中文单表格，每个端口一行）
+```
+
+查看当前上传/下载、正常速度、自动降速值、触发阈值、持续时间、滚动保护、冷却时间及规则状态，单位为 **Mbps**。静态端口不适用的参数显示 `-`；终端较窄时优先保留限速参数。此命令**只读**，不会改变限速或保护计时。安装 `portbw` 后即可使用。
+
 #### 一键安装 / 更新
 
 在 **VLESS VPS** 以 root 执行（不会修改 Xray、WireGuard、已有 nft 表及 root `fq` qdisc）：
@@ -343,21 +351,17 @@ apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL '
 
 安装器从**本正式仓库**下载 `portbw.py`、校验 SHA256 与 Python 语法，自动识别物理出口网卡，安装开机自动恢复服务和约每 1 秒自检定时器。也可以将 `portbw-install.sh` 与 `portbw.py` 放在同一目录，通过 `bash portbw-install.sh` 本地安装。
 
-#### 静态限速：设置、查询、取消
+#### 静态限速：设置、修改、取消
 
 ```bash
 portbw set 40001 10 20  # 40001：TCP+UDP 合计上传 10 Mbps / 合计下载 20 Mbps
 portbw up 40001 15      # 上传上限改为 15 Mbps
 portbw down 40001 30    # 下载上限改为 30 Mbps（直接限速，不是触发阈值）
 portbw down 40001 0     # 仅关闭下载限速；上传额度不变
-portbw show 40001       # 查看端口配置及 nft/tc 状态
-portbw list             # 查看所有已保存的端口限速
-portbw report           # 新版一键总览：中文单表格查看全部静态和自动限速
-portbw audit            # 检查所有限速策略的生效状态
+portbw show 40001       # 查看单个端口的详细配置和内核状态
+portbw audit            # 专门审计所有限速规则的 nft/tc 生效情况
 portbw del 40001        # 仅取消端口限速，不删除 VLESS 节点
 ```
-
-`portbw report` 是新版一键限速总览，沿用 `vless_audit.sh` 的中文方框表格，**每个端口只显示一行**，同时支持静态与自动限速；无需再逐个查询端口。表格包含当前上传/下载、正常上传/下载、降速上传/下载、运行阶段、触发阈值、持续时间、滚动保护、冷却时间和规则状态；速度单位均为 **Mbps**。静态模式不适用的自动参数显示 `-`。终端较窄时优先显示限速参数，部分辅助检查列可通过加宽终端查看。**此命令只读**，不会改变限速或滚动保护计时。
 
 #### 自动限速：达到阈值后降速（V5.2.2）
 
@@ -392,7 +396,7 @@ portbw auto off 40001        # 关闭自动模式，恢复基础上传/下载限
 
 `0` 表示对应方向**不限速**；两个方向都无需限速时用 `portbw del <端口>`。限速覆盖本机进入/离开的 TCP、UDP 流量，不覆盖任意 WireGuard/NAT `FORWARD` 转发流量；上传由 nftables + tc 执行限速，下载使用 tc egress 的单个共享 policer，nftables 负责计数（避免 OUTPUT 超限导致 UDP 程序 `Operation not permitted`）。`--nft-only` 不支持下载限速，请使用默认的 nft+tc 模式以获得完整双向限速。
 
-**旧版升级注意：** 本次升级改变了 tc flower 的协议槽位（从 TCP 专用改为 TCP+UDP 双协议）和保存的 `tc_prefs` 格式。**已使用旧版 `portbw` 创建策略的 VPS 不能保证直接无中断升级**。先执行 `portbw list` 并备份端口及速率；如需迁移，请在维护时段用**旧版** `portbw del <端口>` 逐个取消旧策略，确认旧 tc/nft 规则已清除后再运行上述新安装器，最后按记录重新执行 `portbw set`。取消到重建之间，该端口暂不受 portbw 限制。**不要手动 `nft flush ruleset` 或删除网卡 root qdisc**；发现旧规则残留应先检查，不要强制清理其他业务的规则。未安装过 portbw 的全新 VPS 可直接安装。
+**旧版升级注意：** 本次升级改变了 tc flower 的协议槽位（从 TCP 专用改为 TCP+UDP 双协议）和保存的 `tc_prefs` 格式。**已使用旧版 `portbw` 创建策略的 VPS 不能保证直接无中断升级**。升级前先用旧版查询功能记录所有端口及速率；如需迁移，请在维护时段用**旧版** `portbw del <端口>` 逐个取消旧策略，确认旧 tc/nft 规则已清除后再运行上述新安装器，最后按记录重新执行 `portbw set`。取消到重建之间，该端口暂不受 portbw 限制。**不要手动 `nft flush ruleset` 或删除网卡 root qdisc**；发现旧规则残留应先检查，不要强制清理其他业务的规则。未安装过 portbw 的全新 VPS 可直接安装。
 
 **验收范围：** Debian 12 / `eth0` 上，IPv4 单协议、TCP+UDP 双向混合共享速率、反复修改/删除/重建、重启恢复，以及原始快照全新安装均已实测通过；该实测 VPS 未配置公网 IPv6，因此 IPv6 规则虽通过配置审计，但**没有 IPv6 实际测速结论**。不同发行版和网卡环境仍应进行自己的验收。
 
@@ -713,7 +717,7 @@ socks5 pq-del 41004                 # 取消总配额（不限流量）
 socks5 del 41004                    # 删除本机端口 41004 对应的 SOCKS5 账号
 ```
 
-为兼容旧版，也可以继续输入创建时返回的账号 ID；新建、到期或删除账号**不会改动独立 `portbw` 策略**。
+为兼容旧版，也可以继续输入创建时返回的账号 ID。
 
 ### 5. 可选：每日流量历史（最近 30 天）
 
@@ -725,42 +729,8 @@ socks5-traffic 41004                # 查看端口 41004 最近 30 天的每日�
 
 每日统计按约每分钟采样的增量记录；不能把每日流量直接当作实时剩余配额。
 
-### 6. 可选：按端口限速（独立 portbw）
+### 6. 可选：SOCKS5 端口限速
 
-需要限速时，在**实际运行 SOCKS5 的家宽主机**安装独立的新版 `portbw`，按**本机监听端口**设置（下例 `41004`；不是路由器外部映射端口）：
+SOCKS5 与 VLESS 使用**同一套独立 `portbw` 限速方法**，无需重复设置命令。请在**实际运行 SOCKS5 的家宽主机**按照前文“可选：TCP+UDP 同端口共享限速（portbw）”安装并设置；把示例里的 `40001` 改成 SOCKS5 的**本机监听端口**（如 `41004`），即可使用相同的静态限速或 **30→15 Mbps、100% 持续 5 秒、滚动保护 120 秒、零冷却**的自动限速。查询所有端口时，同样使用前文的 `portbw report`。
 
-```bash
-bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
-portbw set 41004 10 20              # 静态：41004 端口上传 10 Mbps、下载 20 Mbps
-portbw show 41004                   # 查看规则及 NFT/TC 生效状态
-portbw list                         # 查看所有端口限速
-portbw audit                        # 检查内核规则
-portbw del 41004                    # 仅删除该端口限速，不删除 SOCKS5 账号
-```
-
-如需与上面 VLESS 示例相同的**自动滚动限速**，请在 SOCKS5 所在主机按**实际本机监听端口**设置。以下端口 `41004` 为示例；上下行平时各 30 Mbps，达到 100% 并持续 5 秒后降至 15 Mbps，滚动保护至少 2 分钟，恢复后零冷却：
-
-```bash
-args=(
-  41004              # SOCKS5 本机监听端口：41004（不是路由器映射的公网端口）
-  --up 30            # 正常上传上限：30 Mbps
-  --down 30          # 正常下载上限：30 Mbps
-  --trigger 100      # 达到对应方向基础上限的 100%（30 Mbps）才触发
-  --after 5s         # 连续达到触发阈值 5 秒后降速
-  --auto-up 15       # 上传触发后：上传上限 15 Mbps
-  --auto-down 15     # 下载触发后：下载上限 15 Mbps
-  --hold 120s        # 滚动保护至少 120 秒（2 分钟）；高负载会续期
-  --cooldown 0s      # 恢复后无冷却；再次触发仍需连续 5 秒达到门槛
-)
-
-portbw auto set "${args[@]}"       # 设置 SOCKS5 端口的自动限速
-portbw auto status 41004           # 查看自动限速与滚动保护状态
-```
-
-需要**单独关闭**SOCKS5端口的自动限速时，才执行：
-
-```bash
-portbw auto off 41004              # 关闭自动模式，恢复基础速度
-```
-
-SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按原有方式管理 TCP+UDP。SOCKS5 的创建、修改、到期和删除都不会增删修改 `portbw` 规则。升级 `portbw` 不会修改 SOCKS5 账号、配额和服务；已安装旧版 `portbw` 的主机先按上文“旧版升级注意”迁移 tc 规则，勿直接覆盖。
+**注意：** 如果路由器把公网端口 `51004` 映射到家宽主机的 `41004`，限速应设置在本机端口 **`41004`**，不是公网端口 `51004`。SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按本机端口管理 TCP+UDP。SOCKS5 账号创建、到期、删除均不会自动增删 `portbw` 规则；升级 `portbw` 也不会修改 SOCKS5 账号、配额和服务。已安装旧版 `portbw` 的主机先参考前文“旧版升级注意”迁移规则。
