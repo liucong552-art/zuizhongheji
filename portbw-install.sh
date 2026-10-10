@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# portbw Debian/Ubuntu zuizhongheji optional TCP+UDP shared bandwidth release: portbw-install.sh + portbw.py
-# This entry point both bootstraps from GitHub and installs the program and units.
+# portbw v5.2.2 rolling hold release; local pair or remote bootstrap from zuizhongheji/main.
+# Always check the exact embedded SHA256 before installing Python payload.
 # Never resets root qdisc, flushes foreign nft tables, or modifies node services.
 set -Eeuo pipefail
 umask 077
@@ -11,11 +11,12 @@ die() { printf '[portbw] 错误：%s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'HELP'
 用法：
-  bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
-  bash portbw-install.sh [install|update] [--iface eth0] [--nft-only]
+  bash ./portbw-install.sh [install|update] [--iface eth0] [--nft-only]
+  bash <(curl -fsSL https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh) [install|update] [--iface eth0]
 
 Debian/Ubuntu + systemd + root：自动补齐依赖、核对源码哈希、识别默认路由网卡，
-并安装 nft + tc 双层限速、开机恢复服务和每30秒自检 timer。
+并安装 nft + tc 双层限速、开机恢复服务和每1秒自检 timer（best effort）。
+自动检测服务内置 systemd 启动频率限流修复，不需要手工添加 drop-in。
 已有配置和端口规则保留。--nft-only 必须手动指定，不会静默降级。
 HELP
 }
@@ -34,6 +35,32 @@ while (($#)); do
     *) die "未知参数：$1（用 --help 查看用法）" ;;
   esac
 done
+
+# Accept the two-file local bundle or a remote process-substitution bootstrap.
+# A normal local file MUST have a colocated portbw.py; do not silently mix files.
+SOURCE_SCRIPT="${BASH_SOURCE[0]:-}"
+WORK=''
+cleanup_source() {
+  if [[ -n "$WORK" ]]; then rm -rf -- "$WORK"; fi
+}
+trap cleanup_source EXIT
+case "${SOURCE_SCRIPT##*/}" in
+  portbw-install.sh|install.sh)
+    [[ -f "$SOURCE_SCRIPT" ]] || die '本地安装文件不存在'
+    SRC="$(cd -- "$(dirname -- "$SOURCE_SCRIPT")" && pwd -P)"
+    [[ -f "$SRC/portbw.py" ]] || die '本地缺少 portbw.py；请放在同一目录'
+    log "本地源码：$SRC"
+    ;;
+  *)
+    # curl HTTPS + pinned payload digest protect against stale/mismatched uploads.
+    WORK="$(mktemp -d /var/tmp/portbw-src.XXXXXXXX)"
+    SRC="$WORK"
+    BASE='https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main'
+    log "远程下载正式版主体：$BASE/portbw.py"
+    curl --fail --silent --show-error --location --retry 3 --connect-timeout 10 --max-time 90 \
+      "$BASE/portbw.py" -o "$SRC/portbw.py" || die '正式仓库源码下载失败；请核对发布情况'
+    ;;
+esac
 
 [[ ${EUID:-999} -eq 0 ]] || die '请使用 root 执行'
 [[ -f /etc/os-release ]] || die '无法识别系统；仅支持 Debian/Ubuntu'
@@ -61,34 +88,12 @@ for cmd in curl sha256sum python3 nft tc ip ss flock timeout systemctl install m
   command -v "$cmd" >/dev/null || die "依赖安装后仍缺少命令：$cmd"
 done
 
-# Bash process substitution has /dev/fd/N as BASH_SOURCE[0]. If a real local
-# install.sh exists, use a local copy of portbw.py; otherwise fetch from GitHub.
-SOURCE_SCRIPT="${BASH_SOURCE[0]}"
-WORK=''
-cleanup_source() {
-  if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf -- "$WORK"; fi
-}
-trap cleanup_source EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
-if [[ ( "${SOURCE_SCRIPT##*/}" == portbw-install.sh || "${SOURCE_SCRIPT##*/}" == install.sh ) && -f "$SOURCE_SCRIPT" ]]; then
-  SRC="$(cd -- "$(dirname -- "$SOURCE_SCRIPT")" && pwd -P)"
-  [[ -f "$SRC/portbw.py" ]] || die '本地缺少 portbw.py；请与 portbw-install.sh 放在同一目录'
-  log "使用本地源码：$SRC"
-else
-  WORK="$(mktemp -d /var/tmp/portbw-src.XXXXXXXX)"
-  SRC="$WORK"
-  BASE='https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main'
-  log '从 GitHub main 下载限速主体 portbw.py ...'
-  curl -fL --retry 3 --connect-timeout 15 --max-time 120 \
-    --proto '=https' --tlsv1.2 --silent --show-error \
-    "$BASE/portbw.py" -o "$SRC/portbw.py" || die 'GitHub 主体文件下载失败；检查 main 根目录是否有 portbw.py'
-fi
+# The downloaded or local Python file is verified against the same fixed manifest.
+[[ -f "$SRC/portbw.py" ]] || die '缺少 portbw.py'
 
 # Embedded manifest: only TWO executable files need to exist online.
 # The sha256 of portbw.py must change together with this value in the installer.
-EXPECTED_PORTBW_SHA256='489ffd94b8b6d25f02954e6ce0965cd382098f20155125aeaefb4a9fe3735c14'
+EXPECTED_PORTBW_SHA256='225013ce3933c6a56c26110b22ae70749154445695532348e6715f858f58d327'
 ACTUAL_PORTBW_SHA256="$(sha256sum "$SRC/portbw.py" | awk '{print $1}')"
 [[ "$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256" ]] || die "portbw.py SHA256 不符：实际 $ACTUAL_PORTBW_SHA256；为避免旧版混装已停止"
 python3 -B - "$SRC/portbw.py" <<'PY' || die 'portbw.py 语法校验失败'
@@ -153,6 +158,13 @@ install_files() (
   PRESENT=()
   OLD_TIMER_ACTIVE=0
   OLD_WORKER_ACTIVE=0
+  UNIT_NAMES=(portbw-restore.service portbw-watch.service portbw-watch.timer)
+  OLD_ENABLED=()
+  OLD_ACTIVE=()
+  for unit in "${UNIT_NAMES[@]}"; do
+    OLD_ENABLED+=("$(systemctl is-enabled "$unit" 2>/dev/null || true)")
+    OLD_ACTIVE+=("$(systemctl is-active "$unit" 2>/dev/null || true)")
+  done
   systemctl is-active --quiet portbw-watch.timer && OLD_TIMER_ACTIVE=1 || true
   systemctl is-active --quiet portbw-watch.service && OLD_WORKER_ACTIVE=1 || true
 
@@ -160,15 +172,40 @@ install_files() (
     status=$?
     trap - EXIT ERR INT TERM HUP
     if ((SUCCESS == 0 && ARMED == 1)); then
+      systemctl stop portbw-watch.timer >/dev/null 2>&1 || true
+      rollback_failed=0
       for idx in "${!PRESENT[@]}"; do
         target="${PRESENT[$idx]}"
         if [[ -f "$BACKUP/$idx.present" ]]; then
-          cp -a -- "$BACKUP/$idx.old" "$target" || printf '回滚失败：%s\n' "$target" >&2
+          temp_restore="$target.rollback.$$"
+          if cp -a -- "$BACKUP/$idx.old" "$temp_restore" && mv -f -- "$temp_restore" "$target"; then
+            :
+          else
+            rollback_failed=1
+            printf '回滚失败：%s\n' "$target" >&2
+          fi
         else
-          rm -f -- "$target" || true
+          rm -f -- "$target" || rollback_failed=1
         fi
       done
-      printf '[portbw] 安装失败；已尝试回滚程序文件。未清空已有内核限速规则。\n' >&2
+      systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=1
+      for idx in "${!UNIT_NAMES[@]}"; do
+        unit="${UNIT_NAMES[$idx]}"
+        case "${OLD_ENABLED[$idx]}" in
+          enabled|linked) systemctl enable "$unit" >/dev/null 2>&1 || rollback_failed=1 ;;
+          enabled-runtime|linked-runtime) systemctl enable --runtime "$unit" >/dev/null 2>&1 || rollback_failed=1 ;;
+          *) systemctl disable "$unit" >/dev/null 2>&1 || true ;;
+        esac
+        # Do not rerun the old one-shot worker while restoring files.
+        if [[ "$unit" == portbw-watch.timer && "${OLD_ACTIVE[$idx]}" == active ]]; then
+          systemctl start "$unit" >/dev/null 2>&1 || rollback_failed=1
+        fi
+      done
+      printf '[portbw] 安装失败；已尝试回滚程序、配置与 systemd 文件。端口意图状态保留，内核规则未清空；请核对 portbw audit。\n' >&2
+      if ((rollback_failed)); then
+        printf '[portbw] 部分回滚失败，保留备份：%s\n' "$BACKUP" >&2
+        BACKUP=''
+      fi
     fi
     if ((${#STAGED[@]})); then rm -f -- "${STAGED[@]}" || true; fi
     if [[ -n "$BACKUP" ]]; then rm -rf -- "$BACKUP" || true; fi
@@ -179,7 +216,9 @@ install_files() (
   }
   trap rollback_on_exit EXIT
   BACKUP="$(mktemp -d /var/tmp/portbw-backup.XXXXXXXX)"
-  for path in "$PROGRAM" "$WRAPPER"; do
+  for path in "$PROGRAM" "$WRAPPER" /etc/portbw/config.json \
+      /etc/systemd/system/portbw-restore.service \
+      /etc/systemd/system/portbw-watch.service /etc/systemd/system/portbw-watch.timer; do
     idx="${#PRESENT[@]}"
     if [[ -e "$path" || -L "$path" ]]; then
       cp -a -- "$path" "$BACKUP/$idx.old"
@@ -211,6 +250,9 @@ WRAPPER_EOF
   "$WRAPPER" audit || die '安装后审计未通过，未认定安装成功'
   systemctl is-enabled --quiet portbw-watch.timer || die '自动检查 timer 未启用'
   systemctl is-active --quiet portbw-watch.timer || die '自动检查 timer 未启动'
+  # Defense in depth: verify the effective setting after the nested installer.
+  [[ "$(systemctl show portbw-watch.service -p StartLimitIntervalUSec)" == 'StartLimitIntervalUSec=0' ]] || \
+    die 'portbw-watch.service 的有效 StartLimitIntervalSec 非 0；拒绝报告安装成功'
   SUCCESS=1
 )
 

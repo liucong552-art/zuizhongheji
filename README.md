@@ -341,7 +341,7 @@ vless_traffic 40002 --json
 apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
 ```
 
-安装器从**本正式仓库**下载 `portbw.py`、校验 SHA256 与 Python 语法，自动识别物理出口网卡，安装开机自动恢复服务和每 30 秒自检定时器。也可以将 `portbw-install.sh` 与 `portbw.py` 放在同一目录，通过 `bash portbw-install.sh` 本地安装。
+安装器从**本正式仓库**下载 `portbw.py`、校验 SHA256 与 Python 语法，自动识别物理出口网卡，安装开机自动恢复服务和约每 1 秒自检定时器。也可以将 `portbw-install.sh` 与 `portbw.py` 放在同一目录，通过 `bash portbw-install.sh` 本地安装。
 
 #### 设置、查询、取消
 
@@ -354,7 +354,12 @@ portbw show 40001       # 查看端口配置及 nft/tc 状态
 portbw list             # 查看所有已保存的端口限速
 portbw audit            # 检查所有限速策略的生效状态
 portbw del 40001        # 仅取消端口限速，不删除 VLESS 节点
+portbw auto set 40001 --up 1000 --down 100 --trigger 60 --after 1s --auto-up 999 --auto-down 20 --hold 2m --cooldown 60s
+portbw auto status 40001 # 查看自动限速状态
+portbw auto off 40001    # 关闭自动模式，恢复基础速度
 ```
+
+自动模式示例：下载基础速度 100 Mbps，超过 60% 持续 1 秒降至 20 Mbps；持续高负载则滚动保持限速，负载下降后约 120 秒恢复，随后冷却 60 秒。
 
 `0` 表示对应方向**不限速**；两个方向都无需限速时用 `portbw del <端口>`。限速覆盖本机进入/离开的 TCP、UDP 流量，不覆盖任意 WireGuard/NAT `FORWARD` 转发流量；上传由 nftables + tc 执行限速，下载使用 tc egress 的单个共享 policer，nftables 负责计数（避免 OUTPUT 超限导致 UDP 程序 `Operation not permitted`）。`--nft-only` 不支持下载限速，请使用默认的 nft+tc 模式以获得完整双向限速。
 
@@ -702,6 +707,8 @@ portbw show 41004                   # 查看 41004 的限速及 NFT/TC 是否正
 portbw list                         # 列出全部端口的限速配置和运行状态
 portbw audit                        # 检查所有限速规则；若有异常，返回错误状态
 portbw del 41004                    # 只取消 41004 的限速，不删除 SOCKS5 账号
+portbw auto set 41004 --up 1000 --down 100 --trigger 60 --after 1s --auto-up 999 --auto-down 20 --hold 2m --cooldown 60s
+portbw auto status 41004            # 查看自动限速与滚动保护状态
 ```
 
-SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按原有方式管理 TCP+UDP。SOCKS5 的创建、修改、到期和删除都不会增删修改 `portbw` 规则。
+SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按原有方式管理 TCP+UDP。SOCKS5 的创建、修改、到期和删除都不会增删修改 `portbw` 规则。升级 `portbw` 不会修改 SOCKS5 账号、配额和服务；已安装旧版 `portbw` 的主机先按上文“旧版升级注意”迁移 tc 规则，勿直接覆盖。
