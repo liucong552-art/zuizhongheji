@@ -343,23 +343,49 @@ apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL '
 
 安装器从**本正式仓库**下载 `portbw.py`、校验 SHA256 与 Python 语法，自动识别物理出口网卡，安装开机自动恢复服务和约每 1 秒自检定时器。也可以将 `portbw-install.sh` 与 `portbw.py` 放在同一目录，通过 `bash portbw-install.sh` 本地安装。
 
-#### 设置、查询、取消
+#### 静态限速：设置、查询、取消
 
 ```bash
 portbw set 40001 10 20  # 40001：TCP+UDP 合计上传 10 Mbps / 合计下载 20 Mbps
 portbw up 40001 15      # 上传上限改为 15 Mbps
-portbw down 40001 30    # 下载上限改为 30 Mbps
+portbw down 40001 30    # 下载上限改为 30 Mbps（直接限速，不是触发阈值）
 portbw down 40001 0     # 仅关闭下载限速；上传额度不变
 portbw show 40001       # 查看端口配置及 nft/tc 状态
 portbw list             # 查看所有已保存的端口限速
 portbw audit            # 检查所有限速策略的生效状态
 portbw del 40001        # 仅取消端口限速，不删除 VLESS 节点
-portbw auto set 40001 --up 1000 --down 100 --trigger 60 --after 1s --auto-up 999 --auto-down 20 --hold 2m --cooldown 60s
-portbw auto status 40001 # 查看自动限速状态
-portbw auto off 40001    # 关闭自动模式，恢复基础速度
 ```
 
-自动模式示例：下载基础速度 100 Mbps，超过 60% 持续 1 秒降至 20 Mbps；持续高负载则滚动保持限速，负载下降后约 120 秒恢复，随后冷却 60 秒。
+#### 自动限速：达到阈值后降速（V5.2.2）
+
+以下以端口 `40001` 为例：平时上下行各 30 Mbps；达到本方向上限的 100% 并持续 5 秒后，该方向降至 15 Mbps；滚动保护至少 120 秒（2 分钟），持续高负载会续期；恢复后无冷却。**下列 Bash 数组含中文注释，整段复制即可执行**（不是把中文括号插在命令参数之间）。
+
+```bash
+args=(
+  40001              # 本机监听端口：40001（VLESS 可按实际情况改为 443）
+  --up 30            # 正常上传上限：30 Mbps
+  --down 30          # 正常下载上限：30 Mbps
+  --trigger 100      # 触发阈值：基础速度的 100%，即上传或下载达到 30 Mbps
+  --after 5s         # 达到对应方向阈值并持续 5 秒后，开始降速
+  --auto-up 15       # 上传方向触发后：上传降为 15 Mbps
+  --auto-down 15     # 下载方向触发后：下载降为 15 Mbps
+  --hold 120s        # 滚动保护至少 120 秒，即 2 分钟；持续高负载会续期
+  --cooldown 0s      # 恢复基础速度后零冷却，立即允许再次检测违规
+)
+
+portbw auto set "${args[@]}"  # 应用自动限速；上传和下载分别监测、分别触发
+portbw auto status 40001     # 查看自动限速、采样和滚动保护状态
+```
+
+需要**手动停止自动限速**时，另行执行（不要与上面的设置命令一起执行）：
+
+```bash
+portbw auto off 40001        # 关闭自动模式，恢复基础上传/下载限速
+```
+
+`--trigger 100` 表示**基础速度的 100%**，不是整台服务器总带宽的 100%，也不是 100 Mbps。由于采样和限速波动，设置 100% 时即使接近 30 Mbps，也可能尚未达到触发条件。`--after 5s` 是连续达到门槛 5 秒才触发，不是流量一超过就立即降速。`--hold 120s` 是**至少 2 分钟**，持续接近 15 Mbps 或持续超限丢包时会滚动续期；`--cooldown 0s` 只取消恢复后的等待，再次降速仍需重新满足 5 秒的触发条件。
+
+自动模式中只有 `--cooldown` 可以省略（省略默认 `60s`，**零冷却必须明确写 `--cooldown 0s`**），其他参数均为必填；上下行基础速度必须分别大于降速值，且均大于 0。`--trigger` 必须填写，单位为百分比（可填 100），不是 Mbps。`portbw down 40001 30` 只会直接改成**静态下载限速 30 Mbps**，不会设置自动触发门槛，且手动修改会关闭该端口的自动模式。
 
 `0` 表示对应方向**不限速**；两个方向都无需限速时用 `portbw del <端口>`。限速覆盖本机进入/离开的 TCP、UDP 流量，不覆盖任意 WireGuard/NAT `FORWARD` 转发流量；上传由 nftables + tc 执行限速，下载使用 tc egress 的单个共享 policer，nftables 负责计数（避免 OUTPUT 超限导致 UDP 程序 `Operation not permitted`）。`--nft-only` 不支持下载限速，请使用默认的 nft+tc 模式以获得完整双向限速。
 
@@ -698,17 +724,40 @@ socks5-traffic 41004                # 查看端口 41004 最近 30 天的每日�
 
 ### 6. 可选：按端口限速（独立 portbw）
 
-需要限速时，在**实际运行 SOCKS5 的家宽主机**安装原有 `portbw`，再按本机监听端口手动设置：
+需要限速时，在**实际运行 SOCKS5 的家宽主机**安装独立的新版 `portbw`，按**本机监听端口**设置（下例 `41004`；不是路由器外部映射端口）：
 
 ```bash
 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
-portbw set 41004 10 20              # 为 41004 设置上传 10 Mbps、下载 20 Mbps
-portbw show 41004                   # 查看 41004 的限速及 NFT/TC 是否正常生效
-portbw list                         # 列出全部端口的限速配置和运行状态
-portbw audit                        # 检查所有限速规则；若有异常，返回错误状态
-portbw del 41004                    # 只取消 41004 的限速，不删除 SOCKS5 账号
-portbw auto set 41004 --up 1000 --down 100 --trigger 60 --after 1s --auto-up 999 --auto-down 20 --hold 2m --cooldown 60s
-portbw auto status 41004            # 查看自动限速与滚动保护状态
+portbw set 41004 10 20              # 静态：41004 端口上传 10 Mbps、下载 20 Mbps
+portbw show 41004                   # 查看规则及 NFT/TC 生效状态
+portbw list                         # 查看所有端口限速
+portbw audit                        # 检查内核规则
+portbw del 41004                    # 仅删除该端口限速，不删除 SOCKS5 账号
+```
+
+如需与上面 VLESS 示例相同的**自动滚动限速**，请在 SOCKS5 所在主机按**实际本机监听端口**设置。以下端口 `41004` 为示例；上下行平时各 30 Mbps，达到 100% 并持续 5 秒后降至 15 Mbps，滚动保护至少 2 分钟，恢复后零冷却：
+
+```bash
+args=(
+  41004              # SOCKS5 本机监听端口：41004（不是路由器映射的公网端口）
+  --up 30            # 正常上传上限：30 Mbps
+  --down 30          # 正常下载上限：30 Mbps
+  --trigger 100      # 达到对应方向基础上限的 100%（30 Mbps）才触发
+  --after 5s         # 连续达到触发阈值 5 秒后降速
+  --auto-up 15       # 上传触发后：上传上限 15 Mbps
+  --auto-down 15     # 下载触发后：下载上限 15 Mbps
+  --hold 120s        # 滚动保护至少 120 秒（2 分钟）；高负载会续期
+  --cooldown 0s      # 恢复后无冷却；再次触发仍需连续 5 秒达到门槛
+)
+
+portbw auto set "${args[@]}"       # 设置 SOCKS5 端口的自动限速
+portbw auto status 41004           # 查看自动限速与滚动保护状态
+```
+
+需要**单独关闭**SOCKS5端口的自动限速时，才执行：
+
+```bash
+portbw auto off 41004              # 关闭自动模式，恢复基础速度
 ```
 
 SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按原有方式管理 TCP+UDP。SOCKS5 的创建、修改、到期和删除都不会增删修改 `portbw` 规则。升级 `portbw` 不会修改 SOCKS5 账号、配额和服务；已安装旧版 `portbw` 的主机先按上文“旧版升级注意”迁移 tc 规则，勿直接覆盖。
