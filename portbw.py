@@ -1447,6 +1447,173 @@ def install(args):
             raise
         print(f'portbw 安装/更新完成；接口={iface}；双层 tc={enabled}；不会修改 root qdisc。')
 
+def _report_char_width(char):
+    # Match the independent vless_audit.sh table renderer: CJK is 2 cells.
+    from unicodedata import combining, east_asian_width
+    if char in ('\n','\r') or combining(char):return 0
+    return 2 if east_asian_width(char) in ('W','F') else 1
+
+
+def _report_width(value):
+    return sum(_report_char_width(char) for char in str(value))
+
+
+def _report_pad(value,width,align='left'):
+    value=str(value)
+    gap=' '*max(0,width-_report_width(value))
+    return gap+value if align=='right' else value+gap
+
+
+def _report_wrap(value,width):
+    value=str(value or '-')
+    parts=[]
+    for line in value.replace('\r','').split('\n'):
+        line=line.strip()
+        if not line:
+            parts.append('');continue
+        while _report_width(line)>width:
+            cut=0;used=0
+            for i,char in enumerate(line):
+                w=_report_char_width(char)
+                if used+w>width:break
+                cut=i+1;used+=w
+            if not cut:cut=1
+            # Break at a natural slash or separator when possible, like VLESS.
+            breaking=max((i+1 for i,char in enumerate(line[:cut]) if char in '/_:- '),default=0)
+            if breaking and breaking>=cut//2:cut=breaking
+            parts.append(line[:cut].rstrip())
+            line=line[cut:].lstrip()
+        parts.append(line)
+    return parts or ['-']
+
+
+def _report_table(schema,rows):
+    """Same heavy box borders, row separators and CJK alignment as vless_audit.sh.
+
+    Standalone on purpose: SOCKS5 hosts may not have VLESS's renderer installed.
+    schema: (heading,min_width,ideal_width,max_width,align,weight).
+    """
+    headings=[item[0] for item in schema]
+    minimum=[item[1] for item in schema]
+    ideal=[item[2] for item in schema]
+    maximum=[item[3] for item in schema]
+    aligned=[item[4] for item in schema]
+    weights=[item[5] for item in schema]
+    columns_env=os.environ.get('COLUMNS','').strip()
+    term=int(columns_env) if columns_env.isdecimal() and int(columns_env)>0 else shutil.get_terminal_size(fallback=(120,24)).columns
+    available=max(sum(minimum),term-len(schema)-1)
+    widths=ideal[:]
+    if sum(widths)>available:
+        order=sorted(range(len(schema)),key=lambda i:(weights[i],ideal[i]-minimum[i]),reverse=True)
+        remaining=sum(widths)-available
+        while remaining:
+            changed=False
+            for i in order:
+                if widths[i]>minimum[i]:
+                    widths[i]-=1;remaining-=1;changed=True
+                    if not remaining:break
+            if not changed:break
+    elif sum(widths)<available:
+        order=sorted(range(len(schema)),key=lambda i:(weights[i],maximum[i]-ideal[i]),reverse=True)
+        remaining=available-sum(widths)
+        while remaining:
+            changed=False
+            for i in order:
+                if widths[i]<maximum[i]:
+                    widths[i]+=1;remaining-=1;changed=True
+                    if not remaining:break
+            if not changed:break
+    def edge(left,mid,right):return left+mid.join('━'*w for w in widths)+right
+    print(edge('┏','┳','┓'))
+    print('┃'+'│'.join(_report_pad(h,w) for h,w in zip(headings,widths))+'┃')
+    print(edge('┣','╋','┫'))
+    for i,row in enumerate(rows):
+        wrapped=[_report_wrap(item,w) for item,w in zip(row,widths)]
+        for line_index in range(max(map(len,wrapped))):
+            cells=[_report_pad(parts[line_index] if line_index<len(parts) else '',widths[j],aligned[j])
+                   for j,parts in enumerate(wrapped)]
+            print('┃'+'│'.join(cells)+'┃')
+        if i+1<len(rows):print(edge('┣','╋','┫'))
+    print(edge('┗','┻','┛'))
+
+
+def _report_one_table(items):
+    """全中文单表格：每个端口一行；窄终端优先保留限速核心信息。"""
+    columns=[
+        ('端口','right'),('模式','left'),('当前上/下','right'),
+        ('正常上/下','right'),('降速上/下','right'),('运行阶段','left'),
+        ('阈值','right'),('持续','right'),('保护','right'),('冷却','right'),
+        ('监听','left'),('防火墙','left'),('流控','left'),('状态','left'),
+    ]
+    widths=[max(_report_width(head),*(_report_width(row[i]) for row in items))
+            for i,(head,_) in enumerate(columns)]
+    columns_env=os.environ.get('COLUMNS','').strip()
+    term=(int(columns_env) if columns_env.isdecimal() and int(columns_env)>0
+          else shutil.get_terminal_size(fallback=(120,24)).columns)
+    show=list(range(len(columns)))
+    # 诊断类信息在窄终端下最后显示；限速值和触发条件永不省略。
+    # 运行阶段也尽量保留；如终端极窄，仍保持一端口一行而不拆成多张表。
+    for i in (10,11,12,5):
+        if sum(widths[j] for j in show)+len(show)+1<=term:break
+        show.remove(i)
+    frame_width=sum(widths[j] for j in show)+len(show)+1
+    if frame_width>term:
+        print(f'注意：当前终端宽度为 {term} 列，完整限速参数需要 {frame_width} 列；'
+              '请加宽终端，表格不会截断数值。')
+    schema=[(columns[i][0],widths[i],widths[i],widths[i],columns[i][1],1)
+            for i in show]
+    _report_table(schema,[tuple(str(row[i]) for i in show) for row in items])
+    hidden=[columns[i][0] for i in range(len(columns)) if i not in show]
+    if hidden:
+        print('因终端较窄暂不显示：'+'、'.join(hidden)+'；加宽窗口可查看全部列。')
+
+
+def report_all(config):
+    """只读查询全部限速：静态、自动混排，使用现有内核审计快照。"""
+    rows=records()
+    if not rows:
+        print('当前没有已保存的端口限速规则。')
+        return
+    listening=listen_ports()
+    nft_items=nft_snapshot(False)
+    tc_items=tc_snapshot(config['iface']) if config.get('tc_enabled') else None
+    phases={'monitor':'监控','entering':'应用中','hold':'保护中',
+            'restoring':'恢复中','cooldown':'冷却'}
+    auto_count=0;unhealthy=[];items=[]
+    for port,rec in sorted(rows.items()):
+        state,nft,tc=audit_one(port,rec,config,nft_items,tc_items)
+        a=rec.get('auto')
+        now=f'{rate_mbps(rec["up"])}/{rate_mbps(rec["down"])}'
+        if a:
+            auto_count+=1
+            base=f'{rate_mbps(a["base"]["up"])}/{rate_mbps(a["base"]["down"])}'
+            limited=f'{rate_mbps(a["limited"]["up"])}/{rate_mbps(a["limited"]["down"])}'
+            phases_now=rec['runtime']['dirs']
+            phase=f'{phases[phases_now["up"]["phase"]]}/{phases[phases_now["down"]["phase"]]}'
+            trigger=f'{a["trigger_bp"]/100:g}%'
+            after=f'{a["after"]}s'
+            hold=f'{a["hold"]}s'
+            cool=f'{a["cooldown"]}s'
+        else:
+            base=now;limited=phase=trigger=after=hold=cool='-'
+        items.append((port,'自动' if a else '静态',now,base,limited,phase,
+                      trigger,after,hold,cool,
+                      '是' if port in listening else '否','正常' if nft else '异常',
+                      '停用' if tc is None else '正常' if tc else '异常',
+                      '正常' if state=='OK' else '异常'))
+        if state!='OK':unhealthy.append(port)
+    print(f'端口限速总览：共 {len(rows)} 个端口；速度单位 Mbps（上/下=上传/下载）')
+    _report_one_table(items)
+    print('说明：当前=正在生效的限速；正常=基础速度；降速=触发后的速度；'
+          '运行阶段=上传/下载分别对应的状态。')
+    print('阈值=触发百分比；持续=触发前连续秒数；保护=滚动保护秒数；'
+          '冷却=恢复后等待秒数；“-”表示静态模式不适用。')
+    print(f'合计 {len(rows)} 个端口：自动 {auto_count}，静态 {len(rows)-auto_count}；内核异常 {len(unhealthy)}。')
+    if unhealthy:
+        print('注意：端口 '+', '.join(map(str,unhealthy))+' 的规则状态异常，请运行 portbw audit 检查。')
+    print('提示：本命令只读，不会修复规则、改变限速或重置滚动保护计时。')
+
+
 def operate(args):
     action=args.action
     if action=='install':return install(args)
@@ -1469,6 +1636,7 @@ def operate(args):
             commit(port,up,down,config,deleting=action=='del')
             print(f'{port}: {"已手动取消" if action=="del" else f"上传 {rate_mbps(up)}Mbps / 下载 {rate_mbps(down)}Mbps"}')
             return
+        if action=='report':return report_all(config)
         if action=='auto':return auto_operate(args,config)
         if action in ('watch','repair'):
             reconcile(config,monitor=action=='watch')
@@ -1513,7 +1681,7 @@ def main():
     y.add_argument('--cooldown',default='60s',help='恢复后冷却时间，默认 60s，可设 0s')
     for name in ('status','off'):
         y=auto_sub.add_parser(name);y.add_argument('port')
-    for name in ('list','audit','repair','watch','status'):subs.add_parser(name)
+    for name in ('list','report','audit','repair','watch','status'):subs.add_parser(name)
     try:
         if os.geteuid():raise Error('请使用 root')
         operate(p.parse_args())
